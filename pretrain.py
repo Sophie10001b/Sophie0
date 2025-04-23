@@ -34,6 +34,29 @@ class PretrainDataset(torch.utils.data.Dataset):
         self.train_config = train_config
 
         data_files = glob.glob(self.train_config.data_path + "/**/*.parquet", recursive=True)
+        
+        # static results about the dataset
+        domain_stats = {}
+        language_stats = {}
+        for _data_dir in data_files:
+            _dir = _data_dir[len(self.train_config.data_path)+1:]
+            domain = _dir.split("/")[0]
+            language = _dir.split("/")[1]
+            quality = _dir.split("/")[2]
+            data_size = os.path.getsize(_data_dir) / (1024 * 1024)
+
+            if domain not in domain_stats: domain_stats[domain] = data_size
+            else: domain_stats[domain] = domain_stats[domain] + data_size
+
+            if language not in language_stats: language_stats[language] = data_size
+            else: language_stats[language] = language_stats[language] + data_size
+        
+        print("Language:")
+        for (k, v) in language_stats.items(): print(f"{k}:\t {v:.2f} MB")
+        print("\nDomain:")
+        for (k, v) in domain_stats.items(): print(f"{k}:\t {v:.2f} MB")
+        print(f"\nTotal:\t {sum(domain_stats.values()):.2f} MB\n")
+
         datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["text"])
         datas = datas.shuffle(seed=kwargs.pop("seed", 17))
 
