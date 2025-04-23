@@ -1,5 +1,6 @@
 /data
 /result
+/cache
 __pycache__
 .vscode
 .DS_Store

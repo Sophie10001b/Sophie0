@@ -12,7 +12,7 @@ from flash_attn import (
     flash_attn_varlen_func
 )
 from flash_attn.layers.rotary import RotaryEmbedding, apply_rotary_emb
-from flash_attn.ops.rms_norm import RMSNorm
+from flash_attn.ops.triton.layer_norm import RMSNorm
 from flash_attn.modules.mlp import GatedMlp
 from flash_attn.losses.cross_entropy import CrossEntropyLoss
 from einops import rearrange
