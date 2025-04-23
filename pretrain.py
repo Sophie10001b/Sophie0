@@ -191,6 +191,7 @@ def main(train_config: argparse.Namespace):
         gradient_clip_val=1.0,
         callbacks=ModelCheckpoint(every_n_train_steps=train_config.save_steps)
     )
+    if train_config.max_seqlen > 0: train_config.batch_size = train_config.max_token_per_batch // train_config.max_seqlen
     if trainer.num_devices > 1:
         args.batch_size = args.batch_size // trainer.num_devices
         args.max_token_per_batch = args.max_token_per_batch // trainer.num_devices
