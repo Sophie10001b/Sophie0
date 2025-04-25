@@ -39,5 +39,10 @@
 
 **Settings**&emsp; 预训练阶段使用AutoDL中的4张vGPU-32GB完成训练，其中每张标定fp16算力为103 TFLOPs，Compute Capability为8.9，论坛内推测为32GB版本的4080s。并行策略直接使用pytorch lightning的原生FSDP设置，单batch设置跑0.5M tokens，序列长度固定2,048，平均下来每张卡单步更新需要跑到64 batch size，经过测试将梯度累积设定为8，即单卡每步跑8个序列，梯度累积8步，总batch size为256。运行下来4张卡的显存与CUDA基本完全吃满，单步forward + backward大概1.09s，估算下来每一步更新大概需要接近9s，整体跑完大致花费52h，开销约370RMB
 
+### SFT
+**Datasets**&emsp; 微调同样使用BAAI发布的[Infinity-Instruct](https://www.modelscope.cn/datasets/BAAI/Infinity-Instruct)，使用其中的7M大小基础数据集 + 额外的Gen数据集(也就是对话数据集)进行构建为最终的SFT预料
+
+**Settings**&emsp; 微调阶段使用与预训练阶段一致的算力设置。由于SFT数据集中不同对话的长度差异较大，为了避免padding开销，Sophie0使用了Flash Attention 2的`varlen`算子，并手动编写对应的数据预处理生成varlen版本的输入以及对应的SFT labels，具体来说，预处理可以分为以下几步：
+
 ### References
 [^sardana2024ChinchillaOptimal]: Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws. Sardana, Nikhil, et al. ICML'24, https://openreview.net/forum?id=0bmXrtTDUu
