@@ -14,7 +14,7 @@
 
 最后在120G内存下使用64core机器于25min内完成词表构建
 
-### Mondel
+### Model
 模型选择了标准的Transformer Decoder结构，参考现有相似规模的相关工作，将$d_{model}$设为1024，$d_{ff}$设为4096，$n_{layer}$设为28，$n_{head}$设为16，GQA分组数量设置为8，即每两个query head对应于一个key value head。Attention, RoPE以及SwiGLU的实现直接套用[Flash Attention 2](https://github.com/Dao-AILab/flash-attention)自带的实现方式，其中RoPE base直接设置为1M以避免后续在长上下文下额外调整base的情况。最终模型参数总量正好来到了0.5B的规模。由于整体规模有限，vocab embedding直接占据了总学习参数量的13%左右，因此进一步共享了模型的embedding层与lm head投影层以提高中间参数的总占比。
 
 ### Pretrain
