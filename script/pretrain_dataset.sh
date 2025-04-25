@@ -8,8 +8,6 @@ modelscope download --dataset 'BAAI/IndustryCorpus2'\
     'computer_programming_code/english/high/*.parquet'\
     'mathematics_statistics/chinese/high/*.parquet'\
     'mathematics_statistics/english/high/rank_0108*.parquet'\
-    'literature_emotion/chinese/high/00063.parquet' 'literature_emotion/chinese/high/00064.parquet'\
-    'literature_emotion/english/high/01059.parquet' 'literature_emotion/english/high/01060.parquet' 'literature_emotion/english/high/01061.parquet' 'literature_emotion/english/high/01062.parquet'\
     'accommodation_catering_hotel/chinese/high/*.parquet'\
     'accommodation_catering_hotel/english/high/*.parquet'\
     'biomedicine/chinese/high/*.parquet'\

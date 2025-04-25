@@ -284,7 +284,7 @@ class FullAttention(nn.Module):
 
             assert past_key_values is None
 
-            self.rotary._update_cos_sin_cache(seqlen=max_seqlen)
+            self.rotary._update_cos_sin_cache(seqlen=max_seqlen, device=q.device, dtype=q.dtype)
             q, k = apply_rotary_emb(q, self.rotary._cos_cached, self.rotary._sin_cached, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen),\
                 apply_rotary_emb(k, self.rotary._cos_cached, self.rotary._sin_cached, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 

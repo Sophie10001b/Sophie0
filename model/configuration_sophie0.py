@@ -21,6 +21,9 @@ class Sophie0Config(PretrainedConfig):
         pad_token_id: int = 3,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
+        prompt_token_id: int = 8,
+        user_token_id: int = 9,
+        bot_token_id: int = 10,
         tie_word_embeddings: bool = True,
         vocab_size: int = 65536,
         dropout: float = 0.0,
@@ -41,6 +44,10 @@ class Sophie0Config(PretrainedConfig):
 
         self.vocab_size = vocab_size
         self.dropout = dropout
+
+        self.prompt_token_id = prompt_token_id
+        self.user_token_id = user_token_id
+        self.bot_token_id = bot_token_id
 
         super().__init__(
             pad_token_id=pad_token_id,

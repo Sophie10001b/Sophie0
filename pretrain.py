@@ -67,7 +67,7 @@ class PretrainDataset(torch.utils.data.Dataset):
         print(f"\nTotal:\t {sum(domain_stats.values()):.2f} MB\n")
 
         datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["text"], cache_dir=HF_CACHE, num_proc=32)
-        datas = datas.shuffle(seed=kwargs.pop("seed", 17))
+        datas = datas.shuffle(seed=self.train_config.seed)
 
         # pre-chunk
         self.datas = datas.map(
@@ -280,7 +280,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # dataset Args:
-    pretrain_parser = parser.add_argument_group("paths")
+    pretrain_parser = parser.add_argument_group("pretrain")
     pretrain_parser.add_argument("--seed", type=int, default=17)
     pretrain_parser.add_argument("--data_path", type=str, help="Path to the dataset dir", default="data/pretrain")
     pretrain_parser.add_argument("--ckpt_path", type=str, help="Path to the checkpoint", default="result/pretrain")
