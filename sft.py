@@ -74,7 +74,7 @@ class SFTDataset(torch.utils.data.Dataset):
         
         outputs = self.tokenizer(texts, add_special_tokens=False)['input_ids']
         
-        # packing to max_token_per_batch
+        # packing to max_seqlen
         texts.clear()
         cache = []
         batch_length = 0
