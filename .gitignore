@@ -1,4 +1,5 @@
-/data
+/data/pretrain/*
+/data/sft/**/
 /result
 /cache
 __pycache__

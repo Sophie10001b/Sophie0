@@ -168,11 +168,15 @@ class PretrainModule(LightningModule):
             print("------------ End Training ------------")
             self.tokenizer.save_pretrained(os.path.join(self.train_config.ckpt_path, self._date))
 
-        with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
+        if self.trainer.num_devices > 1:
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
+                state_dict = self.model.state_dict()
+        else:
             state_dict = self.model.state_dict()
 
         if self.trainer.global_rank == 0:
             torch.save(state_dict, os.path.join(self.train_config.ckpt_path, self._date, "pytorch_model.bin"))
+            print("finish saving model")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -206,7 +210,10 @@ class PretrainModule(LightningModule):
             gradient_clip_algorithm: Optional[str] = None,
     ):
         assert gradient_clip_algorithm in ('norm', None), gradient_clip_algorithm
-        self.model.clip_grad_norm_(gradient_clip_val)
+        if self.trainer.num_devices > 1:
+            self.model.clip_grad_norm_(gradient_clip_val)
+        else:
+            self.clip_gradients(optimizer, gradient_clip_val, gradient_clip_algorithm)
     
     def forward(self, data: Dict):
         outputs: CausalLMOutputWithPast = self.model(
@@ -237,10 +244,6 @@ def main(train_config: argparse.Namespace):
     if not os.path.exists(train_config.ckpt_path): os.makedirs(train_config.ckpt_path)
 
     model_config = Sophie0Config()
-    # model_config.num_hidden_layers = 2
-    # model_config.hidden_size = 512
-    # model_config.intermediate_size = 2048
-    # model_config.num_heads = 8
 
     trainer = Trainer(
         precision=train_config.precision,
@@ -250,7 +253,7 @@ def main(train_config: argparse.Namespace):
         default_root_dir=train_config.ckpt_path,
         accumulate_grad_batches=train_config.accumulate_grad_batches,
         gradient_clip_val=1.0,
-        logger=TensorBoardLogger("/root/tf-logs"),
+        logger=TensorBoardLogger("/root/tf-logs", name="pretrain"),
         callbacks=ModelCheckpoint(
             every_n_train_steps=train_config.save_steps,
             save_weights_only=True,
@@ -300,9 +303,5 @@ if __name__ == "__main__":
     pretrain_parser.add_argument("--precision", type=str, default="bf16-mixed")
 
     args = parser.parse_args()
-
-    # args.max_token_per_batch = 16384
-    # args.save_steps = 50
-    # args.accumulate_grad_batches = 4
 
     main(args)

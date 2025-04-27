@@ -32,9 +32,9 @@ from model.utils import CosineLRSchedule
 
 torch.set_float32_matmul_precision("medium")
 
-HF_CACHE = os.environ["HF_HOME"]
-# HF_CACHE = "/root/autodl-tmp/hf_cache"
-# os.environ["HF_HOME"] = HF_CACHE
+# HF_CACHE = os.environ["HF_HOME"]
+HF_CACHE = "/root/autodl-tmp/hf_cache"
+os.environ["HF_HOME"] = HF_CACHE
 
 class SFTDataset(torch.utils.data.Dataset):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
@@ -55,18 +55,23 @@ class SFTDataset(torch.utils.data.Dataset):
             self._preprocess,
             batched=True,
             batch_size=5000,
-            num_proc=8,
+            num_proc=32,
             remove_columns=datas.column_names,
-            cache_file_name=os.path.join(HF_CACHE, "parquet/pretrain/sft_map.cache")
+            cache_file_name=os.path.join(HF_CACHE, "parquet/sft/sft_map.cache")
         )
     
     def _preprocess(self, raw):
         texts = []
         for conversation in raw["conversations"]:
             cache = ""
+            # multi-turns conversation split
             for chat in conversation:
                 if chat["from"] == "human":
-                    cache += f"<s><user>{chat["value"]}</s>\n"
+                    if len(chat["value"]) + len(cache) > self.train_config.max_token_per_batch:
+                        if cache != "": texts.append(cache[:-1])
+                        cache = f"<s><user>{chat["value"]}</s>\n"
+                    else:
+                        cache += f"<s><user>{chat["value"]}</s>\n"
                 elif chat["from"] == "gpt":
                     cache += f"<s><bot>{chat["value"]}</s>\n"
             
@@ -79,17 +84,18 @@ class SFTDataset(torch.utils.data.Dataset):
         cache = []
         batch_length = 0
         for conversation in outputs:
-            if batch_length + len(conversation) <= self.train_config.max_seqlen:
+            # filter out too long conversations or cot
+            if batch_length + len(conversation) <= self.train_config.max_token_per_batch:
                 cache.append(conversation)
                 batch_length += len(conversation)
-            else:
+            elif len(cache) > 0:
                 texts.append(cache)
-                cache.clear()
+                cache = []
                 batch_length = 0
         
         if len(cache) > 0:
             texts.append(cache)
-            cache.clear()
+            cache = []
             batch_length = 0
 
         return {"input_ids": texts}
@@ -198,6 +204,7 @@ class SFTModule(LightningModule):
 
         if self.trainer.global_rank == 0:
             torch.save(state_dict, os.path.join(self.train_config.ckpt_path, self._date, "pytorch_model.bin"))
+            print("finish saving model")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -253,7 +260,8 @@ class SFTModule(LightningModule):
 
         self.log("loss", outputs.loss, prog_bar=True, sync_dist=True)
         self.log("lr", self.optimizers().optimizer.param_groups[0]["lr"], prog_bar=True)
-        # self.log("batch_size", batch["input_ids"].size(0), prog_bar=True, sync_dist=True, reduce_fx="sum")
+        self.log("tokens", batch["input_ids"].size(0), prog_bar=True, logger=False, sync_dist=True, reduce_fx="sum")
+        self.log("steps", self.trainer.global_step, prog_bar=True, logger=False)
         self.log("train_tokens", self._train_tokens, sync_dist=True, reduce_fx="sum")
 
         return outputs.loss
@@ -269,10 +277,6 @@ def main(train_config: argparse.Namespace):
     if not os.path.exists(train_config.ckpt_path): os.makedirs(train_config.ckpt_path)
 
     model_config = Sophie0Config()
-    model_config.num_hidden_layers = 2
-    model_config.hidden_size = 512
-    model_config.intermediate_size = 2048
-    model_config.num_heads = 8
 
     trainer = Trainer(
         precision=train_config.precision,
@@ -282,30 +286,29 @@ def main(train_config: argparse.Namespace):
         default_root_dir=train_config.ckpt_path,
         accumulate_grad_batches=train_config.accumulate_grad_batches,
         gradient_clip_val=1.0,
-        logger=TensorBoardLogger(logger_path),
+        logger=TensorBoardLogger(logger_path, name="sft"),
         callbacks=ModelCheckpoint(
-            every_n_train_steps=train_config.save_steps,
+            every_n_epochs=1 if train_config.save_steps == -1 else None,
+            every_n_train_steps=train_config.save_steps if train_config.save_steps != -1 else None,
             save_weights_only=True,
             save_on_train_epoch_end=True
         )
     )
-    if train_config.max_seqlen > 0: train_config.batch_size = train_config.max_token_per_batch // train_config.max_seqlen
 
-    raw_batch_size = train_config.batch_size
+    assert train_config.batch_size == 1 and train_config.max_token_per_batch > 1
+    raw_batch_size = train_config.batch_size * trainer.num_devices * trainer.accumulate_grad_batches
     if trainer.num_devices > 1:
-        train_config.batch_size = train_config.batch_size // trainer.num_devices
         train_config.max_token_per_batch = train_config.max_token_per_batch // trainer.num_devices
     if trainer.accumulate_grad_batches > 1: 
-        train_config.batch_size = train_config.batch_size // trainer.accumulate_grad_batches
         train_config.max_token_per_batch = train_config.max_token_per_batch // trainer.accumulate_grad_batches
 
     model = Sophie0ForCausalLM(model_config)
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(os.path.join(_dir, "model", "tokenizer"), use_fast=True, trust_remote_code=True, local_files_only=True)
     datamodule = SFTDataModule(tokenizer, model_config, train_config)
 
-    if train_config.max_steps == -1: train_config.max_steps = (len(datamodule.data) + raw_batch_size - 1) // raw_batch_size
+    if train_config.max_steps == -1: train_config.max_steps = ((len(datamodule.data) + raw_batch_size - 1) // raw_batch_size) * train_config.max_epochs
 
-    if train_config.pretrained_ckpt_path != "": model.load_state_dict(torch.load(train_config.pretrained_ckpt_path))
+    if train_config.pretrained_ckpt_path != "": model.load_state_dict(torch.load(train_config.pretrained_ckpt_path, mmap='cpu', weights_only=True))
     plmodel = SFTModule(tokenizer, model, model_config, train_config)
     trainer.fit(plmodel, datamodule=datamodule)
 
@@ -321,22 +324,18 @@ if __name__ == "__main__":
 
     sft_parser.add_argument("--max_seqlen", type=int, default=2048)
     sft_parser.add_argument("--max_token_per_batch", type=int, default=524288)
-    sft_parser.add_argument("--batch_size", type=int, default=128)
+    sft_parser.add_argument("--batch_size", type=int, default=1)
     sft_parser.add_argument("--accumulate_grad_batches", type=int, default=1, help="Accumulate gradients for every n batches")
     sft_parser.add_argument("--num_workers", type=int, default=4)
 
     sft_parser.add_argument("--max_steps", type=int, default=-1)
     sft_parser.add_argument("--max_epochs", type=int, default=1)
-    sft_parser.add_argument("--save_steps", type=int, default=5000)
+    sft_parser.add_argument("--save_steps", type=int, default=-1)
     sft_parser.add_argument("--max_lr", type=float, default=1e-4, help="Maximum learning rate")
     sft_parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
     sft_parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of steps to warm up learning rate")
     sft_parser.add_argument("--precision", type=str, default="bf16-mixed")
 
     args = parser.parse_args()
-
-    args.max_token_per_batch = 16384
-    args.save_steps = 50
-    args.accumulate_grad_batches = 4
 
     main(args)
