@@ -59,4 +59,7 @@ if __name__ == "__main__":
     tokenizer = Tokenizer.from_file(os.path.join(_dir, "model", "tokenizer.json"))
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
     tokenizer.add_special_tokens({"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>", "pad_token": "<pad>", "mask_token": "<mask>", "sep_token": "<sep>", "additional_special_tokens": ["<think>", "</think>", "<prompt>", "<user>", "<bot>"]})
-    tokenizer.save_pretrained(os.path.join(_dir, "tokenizer"))
+
+    tokenizer.chat_template = """{% if messages[0]['role'] == 'system' %}{{ '<s><prompt>' + messages[0]['content'] + '</s>\n' }}{% endif %}{% for message in messages %}{% if message['role'] == 'user' %}{{ '<s><user>' + message['content'] + '</s>\n' }}{% endif %}{% if message['role'] == 'assistant' %}{{ '<s><bot>' + message['content'] + '</s>\n' }}{% endif %}{% endfor %}"""
+
+    tokenizer.save_pretrained(os.path.join(_dir, "model", "tokenizer"))

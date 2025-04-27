@@ -97,6 +97,7 @@
     "<bot>"
   ],
   "bos_token": "<s>",
+  "chat_template": "{% if messages[0]['role'] == 'system' %}{{ '<s><prompt>' + messages[0]['content'] + '</s>\n' }}{% endif %}{% for message in messages %}{% if message['role'] == 'user' %}{{ '<s><user>' + message['content'] + '</s>\n' }}{% endif %}{% if message['role'] == 'assistant' %}{{ '<s><bot>' + message['content'] + '</s>\n' }}{% endif %}{% endfor %}",
   "clean_up_tokenization_spaces": false,
   "eos_token": "</s>",
   "extra_special_tokens": {},
