@@ -7,7 +7,7 @@ pretrained_ckpt_path="result/pretrain/2025-04-24 02:12:29/pytorch_model.bin"
 
 max_steps=-1
 max_epochs=2
-save_steps=5000
+save_steps=-1
 
 max_seqlen=2048
 max_token_per_batch=524288

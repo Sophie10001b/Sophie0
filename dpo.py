@@ -32,9 +32,9 @@ from model.utils import CosineLRSchedule
 
 torch.set_float32_matmul_precision("medium")
 
-# HF_CACHE = os.environ["HF_HOME"]
-HF_CACHE = "/root/autodl-tmp/hf_cache"
-os.environ["HF_HOME"] = HF_CACHE
+HF_CACHE = os.environ["HF_HOME"]
+# HF_CACHE = "/root/autodl-tmp/hf_cache"
+# os.environ["HF_HOME"] = HF_CACHE
 
 class DPODataset(torch.utils.data.Dataset):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
@@ -47,7 +47,7 @@ class DPODataset(torch.utils.data.Dataset):
         data_files = glob.glob(self.train_config.data_path + "/**/*.parquet", recursive=True)
         print(f"dpo data size: {sum([os.path.getsize(_) / (1024 * 1024) for _ in data_files]):.4f} MB\n")
 
-        datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["conversations"], cache_dir=HF_CACHE, num_proc=32)
+        datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["prompt", "chosen", "rejected"], cache_dir=HF_CACHE, num_proc=32)
         datas = datas.shuffle(seed=self.train_config.seed)
 
         # pre-chunk
@@ -55,83 +55,86 @@ class DPODataset(torch.utils.data.Dataset):
             self._preprocess,
             batched=True,
             batch_size=5000,
-            num_proc=32,
+            num_proc=1,
             remove_columns=datas.column_names,
             cache_file_name=os.path.join(HF_CACHE, "parquet/dpo/dpo_map.cache")
         )
     
     def _preprocess(self, raw):
         texts = []
-        for conversation in raw["conversations"]:
-            cache = ""
-            # multi-turns conversation split
-            for chat in conversation:
-                if chat["from"] == "human":
-                    if len(chat["value"]) + len(cache) > self.train_config.max_token_per_batch:
-                        if cache != "": texts.append(cache[:-1])
-                        cache = f"<s><user>{chat["value"]}</s>\n"
-                    else:
-                        cache += f"<s><user>{chat["value"]}</s>\n"
-                elif chat["from"] == "gpt":
-                    cache += f"<s><bot>{chat["value"]}</s>\n"
-            
-            if cache != "": texts.append(cache[:-1])
         
-        outputs = self.tokenizer(texts, add_special_tokens=False)['input_ids']
-        
-        # packing to max_seqlen
-        texts.clear()
-        cache = []
-        batch_length = 0
-        for conversation in outputs:
-            # filter out too long conversations or cot
-            if batch_length + len(conversation) <= self.train_config.max_token_per_batch:
-                cache.append(conversation)
-                batch_length += len(conversation)
-            elif len(cache) > 0:
-                texts.append(cache)
-                cache = []
-                batch_length = 0
-        
-        if len(cache) > 0:
-            texts.append(cache)
-            cache = []
-            batch_length = 0
+        pair_cache = []
+        for conversations in [raw["chosen"], raw["rejected"]]:
+            texts = []
+            for conversation in conversations:
+                cache = ""
+                # only select one-turn conversation
+                if len(conversation) < 2: continue
+                if conversation[0]['role'] != 'user' or conversation[1]['role'] != 'assistant': continue
 
+                cache = f"<s><user>{conversation[0]['content']}</s>\n" + f"<s><bot>{conversation[1]['content']}</s>"
+                texts.append(cache)
+            
+            outputs = self.tokenizer(texts, add_special_tokens=False)['input_ids']
+            pair_cache.append(outputs)
+        
+        texts.clear()
+        
+        chosen_batch_length, rejected_batch_length = 0, 0
+        chosen_cache, rejected_cache = [], []
+        for chosen, rejected in zip(pair_cache[0], pair_cache[1]):
+            if max(chosen_batch_length + len(chosen), rejected_batch_length + len(rejected)) <= self.train_config.max_token_per_batch:
+                chosen_cache.append(chosen)
+                rejected_cache.append(rejected)
+                chosen_batch_length += len(chosen)
+                rejected_batch_length += len(rejected)
+            elif len(chosen_cache) > 0 and len(rejected_cache) > 0:
+                texts.append([chosen_cache, rejected_cache])
+                chosen_cache, rejected_cache = [], []
+                chosen_batch_length, rejected_batch_length = 0, 0
+        
+        if len(chosen_cache) > 0 and len(rejected_cache) > 0:
+            texts.append([chosen_cache, rejected_cache])
+            chosen_cache, rejected_cache = [], []
+            chosen_batch_length, rejected_batch_length = 0, 0
+        
         return {"input_ids": texts}
     
     def process(self, indices: list[int]):
-        data = self.datas.select(indices)["input_ids"]
-        data = list(chain(*data))
+        chosen, rejected = self.datas.select(indices)["input_ids"][0]
 
         # generate varlen inputs
-        input_ids, labels = data, deepcopy(data)
-        cu_seqlens, max_seqlen = [0], 0
-        for i in range(len(input_ids)):
-            # replace labels with <pad> except for the bot reply
-            is_bot_reply = False
-            for j in range(len(labels[i])):
-                if labels[i][j] == self.model_config.bot_token_id: is_bot_reply = True
-                elif labels[i][j] == self.model_config.eos_token_id:
-                    if not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
-                    is_bot_reply = False
-                elif not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
+        results = {"chosen": None, "rejected": None}
+        for split, data in zip(["chosen", "rejected"], [chosen, rejected]):
+            input_ids, labels = data, deepcopy(data)
+            cu_seqlens, max_seqlen = [0], 0
+            for i in range(len(input_ids)):
+                # replace labels with <pad> except for the bot reply
+                is_bot_reply = False
+                for j in range(len(labels[i])):
+                    if labels[i][j] == self.model_config.bot_token_id: is_bot_reply = True
+                    elif labels[i][j] == self.model_config.eos_token_id:
+                        if not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
+                        is_bot_reply = False
+                    elif not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
 
-            input_ids[i] = input_ids[i][:-1]
-            labels[i] = labels[i][1:]
-            max_seqlen = max(max_seqlen, len(input_ids[i]))
-            cu_seqlens.append(cu_seqlens[-1] + len(input_ids[i]))
-        
-        input_ids = torch.tensor(list(chain(*input_ids)), dtype=torch.int64)
-        labels = torch.tensor(list(chain(*labels)), dtype=torch.int64)
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+                input_ids[i] = input_ids[i][:-1]
+                labels[i] = labels[i][1:]
+                max_seqlen = max(max_seqlen, len(input_ids[i]))
+                cu_seqlens.append(cu_seqlens[-1] + len(input_ids[i]))
+            
+            input_ids = torch.tensor(list(chain(*input_ids)), dtype=torch.int64)
+            labels = torch.tensor(list(chain(*labels)), dtype=torch.int64)
+            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
 
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen
-        )
+            results[split] = dict(
+                input_ids=input_ids,
+                labels=labels,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen
+            )
+
+        return results
 
     def __getitem__(self, idx: int):
         return idx
@@ -277,6 +280,7 @@ def main(train_config: argparse.Namespace):
     if not os.path.exists(train_config.ckpt_path): os.makedirs(train_config.ckpt_path)
 
     model_config = Sophie0Config()
+    model_config.num_hidden_layers = 1
 
     trainer = Trainer(
         precision=train_config.precision,
@@ -337,5 +341,6 @@ if __name__ == "__main__":
     dpo_parser.add_argument("--precision", type=str, default="bf16-mixed")
 
     args = parser.parse_args()
+    args.max_token_per_batch = 8192
 
     main(args)
