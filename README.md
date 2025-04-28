@@ -69,8 +69,32 @@
 
 随后是对话，由于预训练阶段模型没有系统的学习如何遵循特定的指令以及格式，因此它无法很好的关联上下文，以及预测结束符`</s>`，导致模型生成的结果基本为预训练阶段见过的语料：
 ```
+0: <s><user>请问你是由谁训练研发的呢？</s>
+<s><bot>: 1929年10月15日,第五届世界互联网大会在浙江乌镇开幕.1949年10月15日,第五届世界互联网大会在浙江乌镇开幕.
+ ...
+ 1997年10月15日,第五届世界互联网大会
+1: <pad><pad><s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>的"河洛"(The Mirage of Venus)是19世纪英国数学家,数学家,数学家和建筑师协会(IAEA)于1936年1月1日宣布的英国皇家学会和皇家学会为英国皇家学会(IAEA)的前身.1947年, II.1948年,II.1955年,II.1958年...
 
+2: <s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot>网科技讯 5月27日消息(记者王丽娟)中国科学院院士,中国科学院院士,中国科学院院士,中国工程院院士,国家自然科学基金委员会专家委员会副主任陈和生,1989年12月生,浙江大学数学系系主任.1994年12月生,中国科学院院士,中国科学院院士,中国科学院数学与系统科学研究院研究员,1995年12月生,中国科学院数学与系统科学研究院研究员,中国科学院数学与系统科学研究院研究员...
+
+3: <pad><pad><pad><s><user>能否介绍一下中国的首都呢？</s>
+<s><bot>1644年,丹麦人亨利·高登堡(William C. F. Walls)开始制作电影"罗马假日".1649年,乔治·高登堡在丹麦拍摄了第一部影片"罗马假日".1660年,亨利·高登堡将这部电影拍摄成一部电影拍摄成一部电影.1676年,英国电影制片厂拍摄了第一部电影"罗马假日".1682年,英国电影制片厂拍摄了第一部电影"罗马假日"...
+
+4: <pad><s><user>Could you please tell me a joke about the weather?</s>
+<s><bot>, the most famous dish of the Portuguese and the best in the country, was once a small town. The Portuguese played a key role in the history of the region, but the Portuguese were not the first to embrace it, and the Portuguese played a major role in the history of the region.
+In the 16th century, Portuguese explorers and traders from Portugal, Spain, Portugal, Italy, and Britain arrived in Portugal to settle in the area...
 ```
+
+若使用续写格式，即没有起始符与结束符，则生成结果如下：
+```
+0: <pad><pad><pad><pad>北京是中国的首都，, 2014
+2014年10月29日, 2014年10月17日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日, 2014年10月19日...
+1: There is a story for the cat and the mouse: it's a story of the human race, the human mind, and the human body. The story is told in the narrative of the story. The story is told in the narrative of the story.
+The story of the human soul is told in the narrative of the story...
+```
+可以看见，整体效果依旧较差，存在有很多的重复以及无意义输出，可以认为仅经过pretrain阶段的语言模型并不能很好的利用训练阶段使用的庞大语料库知识
 
 ### SFT
 **Datasets**&emsp; Sophie0在微调阶段同样使用了由BAAI发布的[Infinity-Instruct](https://www.modelscope.cn/datasets/BAAI/Infinity-Instruct)，使用其中的7M大小基础数据集 + 额外的Gen数据集(也就是对话数据集)构建为最终的SFT语料。此外，为了让模型初步学习到CoT模式以及自我认知信息，SFT阶段语料库中同时混入了[NuminaMath-CoT](https://www.modelscope.cn/datasets/OmniData/NuminaMath-CoT)数据让模型学习数学相关的推理知识。最终的用于CoT的数据组成如下，其中序列长度仅统计分词前的原始长度：
@@ -113,8 +137,91 @@ batch2:
 
 不过，虽然已经有了上面的切分策略来保证每个batch的数据量能够尽量逼近但不超过固定上界，但在实际SFT时少部分情况仍然出现了单卡OOM的情况导致FSDP训练失败，因此最后直接扩展至8卡vGPU-32GB进行训练，每步更新的最大token总数为0.5M，梯度累积8步，总计训练2 epoch，接近16k steps，耗时正好约24h，开销约320RMB
 
-**Results**&emsp; loss曲线如下
+**Results**&emsp; SFT阶段的loss曲线如下，可以看出大约2个epoch正好接近平稳
 ![fig2](fig/sft_loss.png)
+
+而在生成方面，我首先尝试了标准的对话格式，其生成结果如下：
+```
+0: <s><user>请问你是由谁训练研发的呢？</s>
+<s><bot>作为AI语言模型，我没有个人情感，也没有情感。但是，我可以为你提供一些关于如何训练和训练神经网络的方法，但请注意，训练神经网络需要使用大量的数据和计算资源，因此我无法回答您的问题。</s>
+
+1: <pad><pad><s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>Transformer架构是一种基于卷积神经网络（Transformer）架构的架构，它通过将输入序列划分为多个子序列，并通过反向传播算法（Decoder）将输入序列分解成更小的子序列。Transformer架构的核心是生成器（Transformer），它通过在输入序列上生成一个输出序列，然后通过反向传播算法来更新输入序列中的下一个元素，最后再将输入序列转换成输出序列。
+Transformer架构的应用非常广泛，包括机器学习、深度学习、自然语言处理、计算机视觉和自然语言生成等领域。这些技术可以用于许多不同的应用领域，如语音识别、自然语言生成、机器翻译、语音识别和自动驾驶等。</s>
+
+2: <s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot>Sure! Here's a C++ example for quick sort:
+
+```cpp
+#include <iostream>
+using namespace std;
+
+void quickSort(int arr[], int n) {
+    int n = arr[0];
+    for (int i = 1; i < n; i++) {
+        for (int j = 0; j < n - i; j++) {
+            if (arr[j] > arr[j + 1]) {
+                cout << arr[j] << " ";
+            }
+            else {
+                cout << arr[j] << " ";
+            }
+        }
+    }
+}
+
+int main() {
+    int arr[] = {1, 2, 3, 4, 5};
+    int n = arr[0];
+    cout << "Sorted array: ";
+    for (int i = 0; i < n; i++) {
+        cout << arr[i] << " ";
+    }
+    cout << endl;
+
+    return 0;
+}
+```
+
+This code defines a function `quickSort` that takes an array `arr` and its size `n` as parameters. It uses a `for` loop to iterate through the array and compare each element with the previous
+
+3: <pad><pad><pad><s><user>能否介绍一下中国的首都呢？</s>
+<s><bot>中国的首都是位于中国云南省和云南省交界处，是中国重要的城市。它位于中国中部，是中国最重要的国际航运中心之一，也是中国最重要的国际航空枢纽之一。</s>
+
+4: <pad><s><user>Could you please tell me a joke about the weather?</s>
+<s><bot>Sure! The weather can be a bit confusing for everyone, but there's a funny twist on it. One way to say it is "climate rain" is to say "forecast" or "snowy."</s>
+```
+
+可以看出，整体情况比仅完成预训练的模型好了不少，但在回答准确性上仍然较差。在中英表现上看，英文问答会比中文问答相对更好，这可能是由于中文语料在整体训练数据中占比相对较少，不过模型基本上可以初步的对指令进行遵循，并试图依据指令作答，整体效果还是非常明显的
+
+另外，我额外尝试对比了数学题在cot和非cot形式下的回答情况，其生成结果如下：
+```
+0: <pad><pad><pad><pad><pad><pad><pad><pad><s><user><s><user>Given that $b$ is a multiple of $2373$, find the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$.</s>
+<s><bot>Since $b$ is a multiple of $2373$, we can write $b^2 + 13b + 40 = (2373 + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 13b + 40 = 2373^2 - 15b + 40$. Since $b$ is a multiple of $2373$, we can write $b^2 + 13b + 40 = (2373 - 15b + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373^2 - 15b + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 
+
+1: <s><user><s><user>Given that $b$ is a multiple of $2373$, find the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$. You could think it step by step.</s>
+<s><bot>**
+First, we need to find the greatest common divisor (GCD) of $b^2 + 13b + 40$ and $b + 5$. 
+
+1. **Calculating $b^2 + 13b + 40$:**
+   \[
+   b^2 + 13b + 40 = (b + 5)^2 - 40 = b^2 + 225 - 40 = b^2 + 224
+   \]
+
+2. **Calculating $b + 5$:**
+   \[
+   b + 5 = 5 + 5 = 10
+   \]
+
+3. **Finding the GCD of $b^2 + 224$:**
+   \[
+   \text{GCD}(b^2 + 224) = \frac{b^2 + 224}{10} = \frac{10 + 224}{10} = \frac{225}{10} = 225
+   \]
+
+Thus, the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$ is $\boxed{225}$.</s>
+```
+
+可以看出，cot形式输出的整体格式好了不少，但答案依旧是错的，整体还是受限于模型的训练语料规模
 
 ### DPO
 

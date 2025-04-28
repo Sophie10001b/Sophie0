@@ -234,11 +234,11 @@ class DPOModule(LightningModule):
         scheduler.step()
     
     def configure_model(self):
-        self.model = wrap(self.model, device_id=self.trainer.strategy.root_device)
-        self.ref_model = wrap(self.ref_model, device_id=self.trainer.strategy.root_device)
-
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
+
+        self.model = wrap(self.model, device_id=self.trainer.strategy.root_device)
+        self.ref_model = wrap(self.ref_model, device_id=self.trainer.strategy.root_device)
     
     # from https://github.com/Lightning-AI/pytorch-lightning/issues/13339
     # to solve the vanilla gradient_clip_norm not support FSDP
@@ -277,24 +277,25 @@ class DPOModule(LightningModule):
         chosen, rejected = data["chosen"], data["rejected"]
 
         # ref model output
-        ref_chosen: CausalLMOutputWithPast = self.ref_model(
-            input_ids=chosen["input_ids"],
-            labels=chosen["labels"],
-            cu_seqlens=chosen["cu_seqlens"],
-            max_seqlen=chosen["max_seqlen"],
-            return_dict=True,
-            use_cache=False
-        )
-        ref_rejected: CausalLMOutputWithPast = self.ref_model(
-            input_ids=rejected["input_ids"],
-            labels=rejected["labels"],
-            cu_seqlens=rejected["cu_seqlens"],
-            max_seqlen=rejected["max_seqlen"],
-            return_dict=True,
-            use_cache=False
-        )
+        with torch.no_grad():
+            ref_chosen: CausalLMOutputWithPast = self.ref_model(
+                input_ids=chosen["input_ids"],
+                labels=chosen["labels"],
+                cu_seqlens=chosen["cu_seqlens"],
+                max_seqlen=chosen["max_seqlen"],
+                return_dict=True,
+                use_cache=False
+            )
+            ref_rejected: CausalLMOutputWithPast = self.ref_model(
+                input_ids=rejected["input_ids"],
+                labels=rejected["labels"],
+                cu_seqlens=rejected["cu_seqlens"],
+                max_seqlen=rejected["max_seqlen"],
+                return_dict=True,
+                use_cache=False
+            )
 
-        ref_chosen_logits, ref_rejected_logits = self._compute_logprob(ref_chosen.logits, chosen), self._compute_logprob(ref_rejected.logits, rejected)
+            ref_chosen_logits, ref_rejected_logits = self._compute_logprob(ref_chosen.logits, chosen), self._compute_logprob(ref_rejected.logits, rejected)
         
         policy_chosen: CausalLMOutputWithPast = self.model(
             input_ids=chosen["input_ids"],
