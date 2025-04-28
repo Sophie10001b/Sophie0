@@ -48,7 +48,7 @@ class DPODataset(torch.utils.data.Dataset):
         data_files = glob.glob(self.train_config.data_path + "/**/*.parquet", recursive=True)
         print(f"dpo data size: {sum([os.path.getsize(_) / (1024 * 1024) for _ in data_files]):.4f} MB\n")
 
-        datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["prompt", "chosen", "rejected"], cache_dir=HF_CACHE, num_proc=32)
+        datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["chosen", "rejected"], cache_dir=HF_CACHE, num_proc=32)
         datas = datas.shuffle(seed=self.train_config.seed)
 
         # pre-chunk
@@ -332,7 +332,7 @@ class DPOModule(LightningModule):
         outputs: Dict = self(batch)
 
         self.log("loss", outputs["loss"], prog_bar=True, sync_dist=True)
-        self.log("chosen_win", outputs["chosen_win"], prog_bar=False, sync_dist=True)
+        self.log("chosen_win", outputs["chosen_win"], prog_bar=False, sync_dist=True, reduce_fx="sum")
         self.log("kl_diff", outputs["kl_diff"], prog_bar=False, sync_dist=True)
         self.log("lr", self.optimizers().optimizer.param_groups[0]["lr"], prog_bar=True)
         self.log("steps", self.trainer.global_step, prog_bar=True, logger=False)
