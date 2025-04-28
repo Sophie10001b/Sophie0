@@ -315,15 +315,16 @@ class DPOModule(LightningModule):
         policy_chosen_logits, policy_rejected_logits = self._compute_logprob(policy_chosen.logits, chosen), self._compute_logprob(policy_rejected.logits, rejected)
 
         # compute DPO loss
-        total_logits = (policy_chosen_logits - ref_chosen_logits) - (policy_rejected_logits - ref_rejected_logits)
+        total_logits = (policy_chosen_logits - policy_rejected_logits) - (ref_chosen_logits - ref_rejected_logits)
         total_loss = -torch.nn.functional.logsigmoid(self.train_config.beta * total_logits)
-        chosen_reward = (policy_chosen_logits - ref_chosen_logits).clone().detach()
-        rejected_reward = (policy_rejected_logits - ref_rejected_logits).clone().detach()
+
+        chosen_win = (policy_chosen_logits > ref_chosen_logits).float().sum().detach()
+        kl_diff = (policy_chosen_logits.exp() * (policy_chosen_logits - ref_chosen_logits).abs() + policy_rejected_logits.exp() * (policy_rejected_logits - ref_rejected_logits).abs()) / 2.0
 
         outputs = dict(
             loss=total_loss.mean(),
-            chosen_reward=chosen_reward.mean(),
-            rejected_reward=rejected_reward.mean(),
+            chosen_win=chosen_win,
+            kl_diff=kl_diff.mean().detach(),
         )
         return outputs
     
@@ -331,8 +332,8 @@ class DPOModule(LightningModule):
         outputs: Dict = self(batch)
 
         self.log("loss", outputs["loss"], prog_bar=True, sync_dist=True)
-        self.log("chosen_reward", outputs["chosen_reward"], prog_bar=False, sync_dist=True)
-        self.log("rejected_reward", outputs["rejected_reward"], prog_bar=False, sync_dist=True)
+        self.log("chosen_win", outputs["chosen_win"], prog_bar=False, sync_dist=True)
+        self.log("kl_diff", outputs["kl_diff"], prog_bar=False, sync_dist=True)
         self.log("lr", self.optimizers().optimizer.param_groups[0]["lr"], prog_bar=True)
         self.log("steps", self.trainer.global_step, prog_bar=True, logger=False)
 
