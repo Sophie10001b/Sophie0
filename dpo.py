@@ -254,7 +254,14 @@ class DPOModule(LightningModule):
         else:
             self.clip_gradients(optimizer, gradient_clip_val, gradient_clip_algorithm)
     
-    def _compute_logprob(self, hidden_state: torch.FloatTensor, input_datas: Dict):
+    def _compute_logprob(
+        self,
+        hidden_state: torch.FloatTensor,
+        input_datas: Dict,
+        frozen_low_logits: Optional[bool]=False,
+        temperature: Optional[float]=2.0,
+        top_p: Optional[float]=0.8
+    ):
         # varlen calculate, with Shape (B * L, D_vocab)
         logits = hidden_state.log_softmax(dim=-1)
         labels = input_datas["labels"]
@@ -262,11 +269,26 @@ class DPOModule(LightningModule):
         actual_logits = torch.gather(logits, dim=-1, index=input_datas["labels"].unsqueeze(-1))[..., 0]
         actual_logits[labels == self.model_config.pad_token_id] = 0
 
+        # if apply frozen, calculate sample ratio
+        if frozen_low_logits:
+            sample_logits = (hidden_state / temperature).softmax(dim=-1)
+            actual_sample_logits = torch.gather(sample_logits, dim=-1, index=input_datas["labels"].unsqueeze(-1))[..., 0]
+            actual_sample_logits[labels == self.model_config.pad_token_id] = 0
+            
+            sorted_sample_logits, _ = torch.sort(sample_logits, dim=-1, descending=True)
+            sorted_sample_logits = torch.cumsum(sorted_sample_logits, dim=-1)
+            top_p_cutoff = (sorted_sample_logits <= top_p).sum(-1).to(torch.float64)
+            cutoff_logits = torch.gather(sample_logits, dim=-1, index=top_p_cutoff.unsqueeze(-1))[..., 0]
+            cutoff_mask = (cutoff_logits <= actual_sample_logits).to(torch.float64)
+        else: cutoff_mask = None
+
         # scatter the valid token
         batch_length = cu_seqlens[1:] - cu_seqlens[:-1]
         scatter_index = torch.arange(1, batch_length.size(0) + 1, device=cu_seqlens.device, dtype=torch.int64)
         scatter_index = scatter_index.repeat_interleave(batch_length)
         scatter_index[labels == self.model_config.pad_token_id] = 0
+
+        if cutoff_mask is not None: scatter_index[cutoff_mask == 0] = 0
 
         # index=0 is the ignore tokens
         actual_logits = scatter_mean(actual_logits, scatter_index, dim=-1, dim_size=batch_length.size(0) + 1)

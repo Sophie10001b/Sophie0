@@ -152,7 +152,7 @@ Transformer架构的应用非常广泛，包括机器学习、深度学习、自
 2: <s><user>Could you please give a C++ example for quick sort?</s>
 <s><bot>Sure! Here's a C++ example for quick sort:
 
-```cpp
+\```cpp
 #include <iostream>
 using namespace std;
 
@@ -181,7 +181,7 @@ int main() {
 
     return 0;
 }
-```
+\```
 
 This code defines a function `quickSort` that takes an array `arr` and its size `n` as parameters. It uses a `for` loop to iterate through the array and compare each element with the previous
 
@@ -192,7 +192,7 @@ This code defines a function `quickSort` that takes an array `arr` and its size 
 <s><bot>Sure! The weather can be a bit confusing for everyone, but there's a funny twist on it. One way to say it is "climate rain" is to say "forecast" or "snowy."</s>
 ```
 
-可以看出，整体情况比仅完成预训练的模型好了不少，但在回答准确性上仍然较差。在中英表现上看，英文问答会比中文问答相对更好，这可能是由于中文语料在整体训练数据中占比相对较少，不过模型基本上可以初步的对指令进行遵循，并试图依据指令作答，整体效果还是非常明显的
+可以看出，整体情况比仅完成预训练的模型好了不少，但在回答准确性上仍然较差。从中英对比的角度来看，英文问答会比中文问答相对更好，这可能是由于中文语料在整体训练数据中占比相对较少，不过模型基本上可以初步的对指令进行遵循，并试图依据指令作答，整体效果还是非常明显的
 
 另外，我额外尝试对比了数学题在cot和非cot形式下的回答情况，其生成结果如下：
 ```
