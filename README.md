@@ -14,6 +14,15 @@
 
 最后在120G内存下使用64core机器于25min内完成词表构建
 
+| Path | Char Counts | Sophie0 Comp. | Qwen2.5 Comp. |
+| --- | --- | --- | --- |
+| news_media/chinese/high/rank_00082.parquet | 0.18B | 1.8940 | 1.6205 |
+| news_media/english/high/rank_01332.parquet | 0.92B | 4.6466 | 4.7232 |
+| mathematics_statistics/english/high/rank_01082.parquet | 1.14B | 3.6269 | 3.2916 |
+| computer_programming_code/english/high/rank_00864.parquet | 0.86B | 4.2720 | 4.2283 |
+| technology_scientific_research/chinese/high/rank_00123.parquet | 0.52B | 1.7518 | 1.6499 |
+| technology_scientific_research/english/high/rank_01466.parquet | 0.86B | 4.0325 | 3.8732 |
+
 ### Model
 模型选择了标准的Transformer Decoder结构，参考现有相似规模的相关工作，将主要参数设置如下：
 

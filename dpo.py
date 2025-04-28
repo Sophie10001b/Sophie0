@@ -10,9 +10,10 @@ import torch.nn as nn
 import transformers
 import lightning as pl
 
+from copy import deepcopy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-from torch.distributed.fsdp.wrap import wrap, enable_wrap
+from torch.distributed.fsdp.wrap import wrap
 from typing import Optional, Dict, Tuple, List, Union, Unpack, Sequence, Any
 from itertools import chain
 from datasets import Dataset, load_dataset
@@ -23,8 +24,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from transformers import AutoTokenizer, PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from flash_attn.bert_padding import unpad_input
 from copy import deepcopy
+from torch_scatter import scatter_mean
 
 from model.modeling_sophie0 import Sophie0ForCausalLM
 from model.configuration_sophie0 import Sophie0Config
@@ -32,9 +33,9 @@ from model.utils import CosineLRSchedule
 
 torch.set_float32_matmul_precision("medium")
 
-HF_CACHE = os.environ["HF_HOME"]
-# HF_CACHE = "/root/autodl-tmp/hf_cache"
-# os.environ["HF_HOME"] = HF_CACHE
+# HF_CACHE = os.environ["HF_HOME"]
+HF_CACHE = "/root/autodl-tmp/hf_cache"
+os.environ["HF_HOME"] = HF_CACHE
 
 class DPODataset(torch.utils.data.Dataset):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
@@ -55,7 +56,7 @@ class DPODataset(torch.utils.data.Dataset):
             self._preprocess,
             batched=True,
             batch_size=5000,
-            num_proc=1,
+            num_proc=32,
             remove_columns=datas.column_names,
             cache_file_name=os.path.join(HF_CACHE, "parquet/dpo/dpo_map.cache")
         )
@@ -176,6 +177,9 @@ class DPOModule(LightningModule):
         self.model_config = model_config
         self.train_config = train_config
 
+        # copy a reference model
+        self.ref_model = deepcopy(self.model)
+
         self._date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self._train_tokens = 0
 
@@ -231,6 +235,10 @@ class DPOModule(LightningModule):
     
     def configure_model(self):
         self.model = wrap(self.model, device_id=self.trainer.strategy.root_device)
+        self.ref_model = wrap(self.ref_model, device_id=self.trainer.strategy.root_device)
+
+        self.ref_model.eval()
+        self.ref_model.requires_grad_(False)
     
     # from https://github.com/Lightning-AI/pytorch-lightning/issues/13339
     # to solve the vanilla gradient_clip_norm not support FSDP
@@ -246,28 +254,89 @@ class DPOModule(LightningModule):
         else:
             self.clip_gradients(optimizer, gradient_clip_val, gradient_clip_algorithm)
     
+    def _compute_logprob(self, hidden_state: torch.FloatTensor, input_datas: Dict):
+        # varlen calculate, with Shape (B * L, D_vocab)
+        logits = hidden_state.log_softmax(dim=-1)
+        labels = input_datas["labels"]
+        cu_seqlens = input_datas["cu_seqlens"]
+        actual_logits = torch.gather(logits, dim=-1, index=input_datas["labels"].unsqueeze(-1))[..., 0]
+        actual_logits[labels == self.model_config.pad_token_id] = 0
+
+        # scatter the valid token
+        batch_length = cu_seqlens[1:] - cu_seqlens[:-1]
+        scatter_index = torch.arange(1, batch_length.size(0) + 1, device=cu_seqlens.device, dtype=torch.int64)
+        scatter_index = scatter_index.repeat_interleave(batch_length)
+        scatter_index[labels == self.model_config.pad_token_id] = 0
+
+        # index=0 is the ignore tokens
+        actual_logits = scatter_mean(actual_logits, scatter_index, dim=-1, dim_size=batch_length.size(0) + 1)
+        return actual_logits[1:]
+
     def forward(self, data: Dict):
-        outputs: CausalLMOutputWithPast = self.model(
-            input_ids=data["input_ids"],
-            labels=data["labels"],
-            cu_seqlens=data["cu_seqlens"],
-            max_seqlen=data["max_seqlen"],
+        # DPO forward
+        chosen, rejected = data["chosen"], data["rejected"]
+
+        # ref model output
+        ref_chosen: CausalLMOutputWithPast = self.ref_model(
+            input_ids=chosen["input_ids"],
+            labels=chosen["labels"],
+            cu_seqlens=chosen["cu_seqlens"],
+            max_seqlen=chosen["max_seqlen"],
+            return_dict=True,
+            use_cache=False
+        )
+        ref_rejected: CausalLMOutputWithPast = self.ref_model(
+            input_ids=rejected["input_ids"],
+            labels=rejected["labels"],
+            cu_seqlens=rejected["cu_seqlens"],
+            max_seqlen=rejected["max_seqlen"],
+            return_dict=True,
+            use_cache=False
+        )
+
+        ref_chosen_logits, ref_rejected_logits = self._compute_logprob(ref_chosen.logits, chosen), self._compute_logprob(ref_rejected.logits, rejected)
+        
+        policy_chosen: CausalLMOutputWithPast = self.model(
+            input_ids=chosen["input_ids"],
+            labels=chosen["labels"],
+            cu_seqlens=chosen["cu_seqlens"],
+            max_seqlen=chosen["max_seqlen"],
             return_dict=True
+        )
+
+        policy_rejected: CausalLMOutputWithPast = self.model(
+            input_ids=rejected["input_ids"],
+            labels=rejected["labels"],
+            cu_seqlens=rejected["cu_seqlens"],
+            max_seqlen=rejected["max_seqlen"],
+            return_dict=True
+        )
+        
+        policy_chosen_logits, policy_rejected_logits = self._compute_logprob(policy_chosen.logits, chosen), self._compute_logprob(policy_rejected.logits, rejected)
+
+        # compute DPO loss
+        total_logits = (policy_chosen_logits - ref_chosen_logits) - (policy_rejected_logits - ref_rejected_logits)
+        total_loss = -torch.nn.functional.logsigmoid(self.train_config.beta * total_logits)
+        chosen_reward = (policy_chosen_logits - ref_chosen_logits).clone().detach()
+        rejected_reward = (policy_rejected_logits - ref_rejected_logits).clone().detach()
+
+        outputs = dict(
+            loss=total_loss.mean(),
+            chosen_reward=chosen_reward.mean(),
+            rejected_reward=rejected_reward.mean(),
         )
         return outputs
     
     def training_step(self, batch: Dict, batch_idx):
-        outputs: CausalLMOutputWithPast = self(batch)
-        # varlen
-        self._train_tokens += batch["input_ids"].size(0)
+        outputs: Dict = self(batch)
 
-        self.log("loss", outputs.loss, prog_bar=True, sync_dist=True)
+        self.log("loss", outputs["loss"], prog_bar=True, sync_dist=True)
+        self.log("chosen_reward", outputs["chosen_reward"], prog_bar=False, sync_dist=True)
+        self.log("rejected_reward", outputs["rejected_reward"], prog_bar=False, sync_dist=True)
         self.log("lr", self.optimizers().optimizer.param_groups[0]["lr"], prog_bar=True)
-        self.log("tokens", batch["input_ids"].size(0), prog_bar=True, logger=False, sync_dist=True, reduce_fx="sum")
         self.log("steps", self.trainer.global_step, prog_bar=True, logger=False)
-        self.log("train_tokens", self._train_tokens, sync_dist=True, reduce_fx="sum")
 
-        return outputs.loss
+        return outputs["loss"]
 
 def main(train_config: argparse.Namespace):
     pl.seed_everything(train_config.seed)
@@ -280,7 +349,6 @@ def main(train_config: argparse.Namespace):
     if not os.path.exists(train_config.ckpt_path): os.makedirs(train_config.ckpt_path)
 
     model_config = Sophie0Config()
-    model_config.num_hidden_layers = 1
 
     trainer = Trainer(
         precision=train_config.precision,
@@ -292,6 +360,7 @@ def main(train_config: argparse.Namespace):
         gradient_clip_val=1.0,
         logger=TensorBoardLogger(logger_path, name="dpo"),
         callbacks=ModelCheckpoint(
+            dirpath=train_config.ckpt_path,
             every_n_epochs=1 if train_config.save_steps == -1 else None,
             every_n_train_steps=train_config.save_steps if train_config.save_steps != -1 else None,
             save_weights_only=True,
@@ -340,7 +409,8 @@ if __name__ == "__main__":
     dpo_parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of steps to warm up learning rate")
     dpo_parser.add_argument("--precision", type=str, default="bf16-mixed")
 
+    dpo_parser.add_argument("--beta", type=float, default=0.1, help="Beta for DPO")
+
     args = parser.parse_args()
-    args.max_token_per_batch = 8192
 
     main(args)

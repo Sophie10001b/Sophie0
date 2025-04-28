@@ -61,44 +61,44 @@ class SFTDataset(torch.utils.data.Dataset):
         )
     
     def _preprocess(self, raw):
-        texts = []
+        tokenized_text = []
         for conversation in raw["conversations"]:
-            cache = ""
+            cache = []
             # multi-turns conversation split
             for chat in conversation:
                 if chat["from"] == "human":
-                    if len(chat["value"]) + len(cache) > self.train_config.max_token_per_batch:
-                        if cache != "": texts.append(cache[:-1])
-                        cache = f"<s><user>{chat["value"]}</s>\n"
+                    _tokenized = self.tokenizer(f"<s><user>{chat["value"]}</s>\n", add_special_tokens=False)['input_ids']
+                    if len(cache) + len(_tokenized) > self.train_config.max_token_per_batch:
+                        if len(cache) > 0: tokenized_text.append(cache)
+                        cache = _tokenized
                     else:
-                        cache += f"<s><user>{chat["value"]}</s>\n"
+                        cache += _tokenized
                 elif chat["from"] == "gpt":
-                    cache += f"<s><bot>{chat["value"]}</s>\n"
+                    _tokenized = self.tokenizer(f"<s><bot>{chat["value"]}</s>\n", add_special_tokens=False)['input_ids']
+                    cache += _tokenized
             
-            if cache != "": texts.append(cache[:-1])
-        
-        outputs = self.tokenizer(texts, add_special_tokens=False)['input_ids']
+            if len(cache) > 0: tokenized_text.append(cache)
         
         # packing to max_seqlen
-        texts.clear()
+        results = []
         cache = []
         batch_length = 0
-        for conversation in outputs:
+        for conversation in tokenized_text:
             # filter out too long conversations or cot
             if batch_length + len(conversation) <= self.train_config.max_token_per_batch:
                 cache.append(conversation)
                 batch_length += len(conversation)
             elif len(cache) > 0:
-                texts.append(cache)
+                results.append(cache)
                 cache = []
                 batch_length = 0
         
         if len(cache) > 0:
-            texts.append(cache)
+            results.append(cache)
             cache = []
             batch_length = 0
 
-        return {"input_ids": texts}
+        return {"input_ids": results}
     
     def process(self, indices: list[int]):
         data = self.datas.select(indices)["input_ids"]
