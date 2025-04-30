@@ -27,6 +27,7 @@ class Sophie0Config(PretrainedConfig):
         tie_word_embeddings: bool = True,
         vocab_size: int = 65536,
         dropout: float = 0.0,
+        right_shift: bool = False,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -44,6 +45,7 @@ class Sophie0Config(PretrainedConfig):
 
         self.vocab_size = vocab_size
         self.dropout = dropout
+        self.right_shift = right_shift
 
         self.prompt_token_id = prompt_token_id
         self.user_token_id = user_token_id

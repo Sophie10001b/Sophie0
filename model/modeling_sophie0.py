@@ -552,6 +552,10 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
                     loss = loss.mean()
             else:
                 assert labels.dim() == 2
+                if self.config.right_shift:
+                    labels = labels[:, 1:]
+                    logits = logits[:, :-1].contiguous()
+                    
                 loss = self.criterion(logits.flatten(0, 1), labels.flatten(0, 1))
                 if labels_mask is not None:
                     loss = loss * labels_mask.flatten(0, 1)
