@@ -82,28 +82,23 @@ class DPODataset(torch.utils.data.Dataset):
         
         texts.clear()
         
-        # chosen_batch_length, rejected_batch_length = 0, 0
-        # chosen_cache, rejected_cache = [], []
-        # for chosen, rejected in zip(pair_cache[0], pair_cache[1]):
-        #     if max(chosen_batch_length + len(chosen), rejected_batch_length + len(rejected)) <= self.train_config.max_token_per_batch:
-        #         chosen_cache.append(chosen)
-        #         rejected_cache.append(rejected)
-        #         chosen_batch_length += len(chosen)
-        #         rejected_batch_length += len(rejected)
-        #     elif len(chosen_cache) > 0 and len(rejected_cache) > 0:
-        #         texts.append([chosen_cache, rejected_cache])
-        #         chosen_cache, rejected_cache = [], []
-        #         chosen_batch_length, rejected_batch_length = 0, 0
-        
-        # if len(chosen_cache) > 0 and len(rejected_cache) > 0:
-        #     texts.append([chosen_cache, rejected_cache])
-        #     chosen_cache, rejected_cache = [], []
-        #     chosen_batch_length, rejected_batch_length = 0, 0
-
-        # 1 sequence per batch
+        chosen_batch_length, rejected_batch_length = 0, 0
+        chosen_cache, rejected_cache = [], []
         for chosen, rejected in zip(pair_cache[0], pair_cache[1]):
-            if len(chosen) > self.train_config.max_token_per_batch or len(rejected) > self.train_config.max_token_per_batch: continue
-            texts.append([[chosen], [rejected]])
+            if max(chosen_batch_length + len(chosen), rejected_batch_length + len(rejected)) <= self.train_config.max_token_per_batch:
+                chosen_cache.append(chosen)
+                rejected_cache.append(rejected)
+                chosen_batch_length += len(chosen)
+                rejected_batch_length += len(rejected)
+            elif len(chosen_cache) > 0 and len(rejected_cache) > 0:
+                texts.append([chosen_cache, rejected_cache])
+                chosen_cache, rejected_cache = [], []
+                chosen_batch_length, rejected_batch_length = 0, 0
+        
+        if len(chosen_cache) > 0 and len(rejected_cache) > 0:
+            texts.append([chosen_cache, rejected_cache])
+            chosen_cache, rejected_cache = [], []
+            chosen_batch_length, rejected_batch_length = 0, 0
         
         return {"input_ids": texts}
     
