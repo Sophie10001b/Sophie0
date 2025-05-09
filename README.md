@@ -273,9 +273,9 @@ Thus, the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$ is $\boxed{225
 
 此外，考虑到已有工作中提到的DPO训练时正负样例选择概率同时下降的问题，参考[此篇总结](https://zhuanlan.zhihu.com/p/698852522)以及另一篇工作[^liu2024RPO]，Sophie0采用了类似于RPO的损失项：
 
-$$
+```math
 \mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x, y_w, y_l)\sim D}\left[\log \sigma \left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)}-\beta\log\frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right) + \beta\log\pi_\theta(y_w|x)\right]
-$$
+```
 
 也就是将正例的SFT损失加入至原始的偏好损失，从而约束$\pi_\theta$的正例输出概率上升。为了简化调参，该损失的倍率直接套用DPO的$\beta$
 
@@ -296,7 +296,7 @@ $$
 </tr>
 </table>
 
-可以发现，尽管已经添加了SFT损失项的约束，Sophie0在DPO过程中仍然伴随有明显的正例概率下降问题，即`chosen_reward`持续下降，也就是说正例的选择概率反而比$\pi_{ref}$小，而对应的`chosen_win`也伴随着缓慢下降的趋势。而负例的reward则下降的更快，从而让整体的偏好损失正常下降，以及作为约束项的SFT loss缓慢上升。整体曲线趋势与之前的一些工作相似。由于DPO阶段仅训练了1个epoch，因此也不需要考虑在后续epoch中的过拟合问题
+可以发现，尽管已经添加了SFT损失项的约束，Sophie0在DPO过程中仍然伴随有明显的正例概率下降问题，即`chosen_reward`持续下降，也就是说正例的选择概率反而比$\pi_{ref}$小，不过对应的`chosen_win`随着训练会缓慢上升，但仍然没有达到50%。与之相对，负例的reward则下降的更快，从而让整体的偏好损失正常下降，以及作为约束项的SFT loss缓慢上升。整体曲线趋势与之前的一些工作相似。由于DPO阶段仅训练了1个epoch，因此也不需要考虑在后续epoch中的过拟合问题
 
 另外值得注意的是，DPO阶段对batch size的要求不低，Sophie0在初始尝试的时候使用了约0.15M tokens的batch size，此时偏好loss的曲线出现明显震荡，最终模型的正常生成能力也被破坏，因此需要足够多对正负例样本来引导模型在每一步的更新
 
