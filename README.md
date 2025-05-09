@@ -267,7 +267,7 @@ Transformer的架构如下：
 2: <s><user>Could you please give a C++ example for quick sort?</s>
 <s><bot>Certainly! Here's a C++ example for quick sort:
 
-```cpp
+\```cpp
 #include <iostream>
 #include <vector>
 
@@ -283,7 +283,7 @@ int main() {
     cout << endl;
     return 0;
 }
-```
+\```
 
 In this code, we define a function `cache` that takes a positive integer `n` as input. Inside the function, we initialize an empty vector `cout` to store the elements of the array `n`. We then use a `for` loop to iterate `n` times, updating the `i` value of `n` with the current element `i` in the vector. Finally, we return the `cout` vector.
 
@@ -391,7 +391,7 @@ Transformer架构在图像识别、语音识别、自然语言处理、推荐系
 1: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>Could you please give a C++ example for quick sort?</s>
 <s><bot>Certainly! The C++ example for quick sort is as follows:
 
-```cpp
+\```cpp
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -415,7 +415,7 @@ int main() {
     sort(arr);
     return 0;
 }
-```
+\```
 
 In this example, we define a function `sort` that takes an array (`arr`) and an integer (`arr[i]`) as input. Inside the function, we use the `std::sort` function to sort the elements of the array. The `sort` function takes three parameters: `arr`, `arr`, and `arr[i]`. 
 
