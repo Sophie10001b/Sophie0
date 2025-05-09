@@ -1,7 +1,50 @@
-## Sophie0 -- 单人0.5B Toy LLM项目
+<div align="center">
+<h1>Sophie0</h1>
+<h2>单人0.5B Toy LLM项目</h2>
+</div>
+
+---
+
+<div align="center">
+<h3>目录</h3>
+</div>
+
+- [简介](#简介)
+- [参考资料](#参考资料)
+- [训练流程](#训练流程)
+- [推理优化](#推理优化)
+
+---
+
+<div align="center">
+<h3>简介</h3>
+</div>
+
+Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在于完整跑通**预训练(Pretrain)**、**监督微调(Supervised Fine-tune, SFT)**、**直接偏好优化(Direct Preference Optimization, DPO)**、以及显示思维链推理等主要流程。其中预训练阶段使用BAAI开源的多领域数据集，总数据量约11B Tokens，消耗52x4 GPU hours；微调阶段使用BAAI以及数学CoT数据在内总计9.74M行对话数据，消耗24x8 GPU hours；DPO阶段使用BAAI的偏好数据以及从LLama 3提取的英语对话数据在内总计159.3k对数据，消耗1x4 GPU hours
+
+此外，本项目进一步探讨了在下游SFT和DPO阶段完全使用变长(varlen)序列训练的可行性以及实现方式，充分利用了flash attention 2自带的`varlen attention` 和 `varlen RoPE`算子，同时也探讨了批量推理时引入的填充token对输出的影响，以及如何通过设计兼容varlen的KV Cache类直接基于Huggingface GenerationMixin接口无缝切块填充推理和无填充变长序列推理
+
+---
+
+<div align="center">
+<h3>参考资料</h3>
+</div>
+
+本项目主要参考了以下开源项目：
+- https://github.com/jingyaogong/minimind
+- https://github.com/zhanshijinwat/Steel-LLM
+- https://github.com/qiufengqijun/mini_qwen
+
+以及其它来源于知乎的未列出但十分有价值的关于SFT，PPO，DPO，GRPO，Reasoning等阶段的分析与复现文章
+
+---
+
+<div align="center">
+<h3>训练流程</h3>
+</div>
 
 ### Tokenizer
-参考Qwen 2.5，使用Huggingface Tokenizers库提供的BPE实现，加上Qwen 2.5使用的NFC Normalization + Regex Split + ByteLevel进行pre tokenization，得到BBPE词表，总大小为65536。其中tokenizer数据集来源如下，均直接从预训练数据集中抽取固定大小的子集，最终得到了中文:英文约2:5的词表构建语料:
+参考Qwen 2.5，Sophie0使用Huggingface Tokenizers库提供的BPE实现，加上Qwen 2.5使用的NFC Normalization + Regex Split + ByteLevel进行pre tokenization，得到BBPE词表，总大小为65536。其中tokenizer数据集来源如下，均直接从预训练数据集中抽取固定大小的子集，最终得到了中文:英文约2:5的词表构建语料:
 
 | Path | Size |
 | --- | --- |
@@ -229,20 +272,29 @@ Thus, the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$ is $\boxed{225
 **Settings**&emsp; 参考SFT阶段的varlen切分，DPO阶段同样使用varlen算子，并保证每一batch中以(prompt + max(正例，负例))计算的总token数上界不超过0.25M。DPO阶段仅使用4张vGPU-32G进行训练，因此梯度累积扩大为16步，即每一步有16k个token均分至4张GPU。DPO阶段为避免过拟合与训练稳定，参考已有的工作与开源项目，学习率上界设置为5e-7，训练1个epoch，更新约380步，总耗时约1.2h，开销约8.2RMB
 
 此外，考虑到已有工作中提到的DPO训练时正负样例选择概率同时下降的问题，参考[此篇总结](https://zhuanlan.zhihu.com/p/698852522)以及另一篇工作[^liu2024RPO]，Sophie0采用了类似于RPO的损失项：
+
 $$
 \mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x, y_w, y_l)\sim D}\left[\log \sigma \left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)}-\beta\log\frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right) + \beta\log\pi_\theta(y_w|x)\right]
 $$
+
 也就是将正例的SFT损失加入至原始的偏好损失，从而约束$\pi_\theta$的正例输出概率上升。为了简化调参，该损失的倍率直接套用DPO的$\beta$
 
 **Results**&emsp; 首先是DPO训练期间的loss曲线与reward曲线
 
-<figure>
-<img src="fig/dpo_padding/chosen_reward.png" height=150/>
-<img src="fig/dpo_padding/reject_reward.png" height=150/>
-<img src="fig/dpo_padding/dpo_loss.png" height=150/>
-<img src="fig/dpo_padding/sft_loss.png" height=150/>
-<img src="fig/dpo_padding/chosen_win.png" height=150/>
-</figure>
+<table>
+<tr>
+<td><img src="fig/dpo_padding/chosen_reward.png" height=150/></td>
+<td><img src="fig/dpo_padding/reject_reward.png" height=150/></td>
+<td><img src="fig/dpo_padding/chosen_win.png" height=150/></td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td><img src="fig/dpo_padding/dpo_loss.png" height=150/></td>
+<td><img src="fig/dpo_padding/sft_loss.png" height=150/></td>
+</tr>
+</table>
 
 可以发现，由于SFT损失项的约束，Sophie0在DPO过程中并没有出现明显的正例概率下降问题，即`chosen_reward`维持在了0附近，也就是说正例的选择概率与$\pi_{ref}$类似，对应的`chosen_win`也正好保持在了50%附近。而负例的reward则稳定下降，整体的偏好损失正常下降，而作为约束项的SFT loss则缓慢上升。整体曲线趋势与之前的一些工作相似。由于DPO阶段仅训练了1个epoch，因此也不需要考虑在后续epoch中的过拟合问题
 
@@ -305,9 +357,14 @@ When you run this program, it will output: `200
 ### GRPO + Reasoning
 *Comming soon, 由于模型规模较小，预计使用一半的reasoning数据集先进行SFT以对齐格式*
 
+---
+
+<div align="center">
+<h3>推理优化</h3>
+</div>
 
 ### 变长推理
-**Background**&emsp; 在单人用户对话中，LLM可能仅需要处理batch = 1的情况，但在跑benchmark或多用户场景，对batch inference的支持能够极大的提升GPU的利用率。一般来说，batch inference仅需要对输入的token进行左padding即可，但在LLM主要阶段全部使用padding-free策略进行训练的情况下，模型会难以处理很少见到的<pad> token，导致注意力无法正确关注到正文内容。即使在将pad token替换为eos token后仍然难以缓解该问题。
+**Background**&emsp; 在单人用户对话中，LLM可能仅需要处理batch = 1的情况，但在跑benchmark或多用户场景，对batch inference的支持能够极大的提升GPU的利用率。一般来说，batch inference仅需要对输入的token进行左padding即可，但在LLM主要阶段全部使用padding-free策略进行训练的情况下，模型会难以处理很少见到的\<pad\> token，导致注意力无法正确关注到正文内容。即使在将pad token替换为eos token后仍然难以缓解该问题。
 
 作为示例，模型的输入选择了一些短问题 + 长段的数学CoT，对应的batch inference结果如下：
 ```
@@ -366,9 +423,9 @@ When you run this program, it will output: `200
    ...
 ```
 
-可以发现，在<pad>占据主要输入的情况下，模型的输出内容受到了明显影响，仅有不包含<pad>的数学CoT回答仍然保持正常。
+可以发现，在\<pad\>占据主要输入的情况下，模型的输出内容受到了明显影响，仅有不包含\<pad\>的数学CoT回答仍然保持正常。
 
-将tokenizer的<pad>替换为结束符，对应的输出结果如下：
+将tokenizer的\<pad\>替换为结束符，对应的输出结果如下：
 ```
 0: </s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s><s><user>能否解释一下Transformer架构呢？</s>
 <s><bot>提创意的「�家。年迈时，</s>
@@ -469,6 +526,8 @@ By using this code, you can easily sort any given array in ascending order.</s>
 - `Output`: 在得到模型的当前步输出后，需要通过`cu_seqlens`提取出每个序列最后的token，作为当前步生成的新token
 
 通过以上步骤，Sophie0即可使用varlen attention算子以padding-free形式处理不定长数据的batch inference
+
+---
 
 ### References
 [^sardana2024ChinchillaOptimal]: Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws. Sardana, Nikhil, et al. ICML'24.
