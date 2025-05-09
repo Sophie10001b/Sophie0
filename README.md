@@ -284,19 +284,19 @@ $$
 <table>
 <tr>
 <td><img src="fig/dpo_padding/chosen_reward.png" height=150/></td>
-<td><img src="fig/dpo_padding/reject_reward.png" height=150/></td>
+<td><img src="fig/dpo_padding/rejected_reward.png" height=150/></td>
 <td><img src="fig/dpo_padding/chosen_win.png" height=150/></td>
 </tr>
 </table>
 
 <table>
 <tr>
-<td><img src="fig/dpo_padding/dpo_loss.png" height=150/></td>
+<td><img src="fig/dpo_padding/preference_loss.png" height=150/></td>
 <td><img src="fig/dpo_padding/sft_loss.png" height=150/></td>
 </tr>
 </table>
 
-可以发现，由于SFT损失项的约束，Sophie0在DPO过程中并没有出现明显的正例概率下降问题，即`chosen_reward`维持在了0附近，也就是说正例的选择概率与$\pi_{ref}$类似，对应的`chosen_win`也正好保持在了50%附近。而负例的reward则稳定下降，整体的偏好损失正常下降，而作为约束项的SFT loss则缓慢上升。整体曲线趋势与之前的一些工作相似。由于DPO阶段仅训练了1个epoch，因此也不需要考虑在后续epoch中的过拟合问题
+可以发现，尽管已经添加了SFT损失项的约束，Sophie0在DPO过程中仍然伴随有明显的正例概率下降问题，即`chosen_reward`持续下降，也就是说正例的选择概率反而比$\pi_{ref}$小，而对应的`chosen_win`也伴随着缓慢下降的趋势。而负例的reward则下降的更快，从而让整体的偏好损失正常下降，以及作为约束项的SFT loss缓慢上升。整体曲线趋势与之前的一些工作相似。由于DPO阶段仅训练了1个epoch，因此也不需要考虑在后续epoch中的过拟合问题
 
 另外值得注意的是，DPO阶段对batch size的要求不低，Sophie0在初始尝试的时候使用了约0.15M tokens的batch size，此时偏好loss的曲线出现明显震荡，最终模型的正常生成能力也被破坏，因此需要足够多对正负例样本来引导模型在每一步的更新
 
