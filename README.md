@@ -1,5 +1,5 @@
 <div align="center">
-<h1>Sophie0</h1>
+<h1>⭐Sophie0⭐</h1>
 <h2>单人0.5B Toy LLM项目</h2>
 </div>
 
