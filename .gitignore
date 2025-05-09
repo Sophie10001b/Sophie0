@@ -4,6 +4,8 @@
 /data/benchmark/**/*
 /result
 /cache
+/dpo_hf*
+/dpo_padding*
 __pycache__
 .vscode
 .DS_Store

@@ -197,7 +197,7 @@ This code defines a function `quickSort` that takes an array `arr` and its size 
 另外，我额外尝试对比了数学题在cot和非cot形式下的回答情况，其生成结果如下：
 ```
 0: <pad><pad><pad><pad><pad><pad><pad><pad><s><user><s><user>Given that $b$ is a multiple of $2373$, find the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$.</s>
-<s><bot>Since $b$ is a multiple of $2373$, we can write $b^2 + 13b + 40 = (2373 + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 13b + 40 = 2373^2 - 15b + 40$. Since $b$ is a multiple of $2373$, we can write $b^2 + 13b + 40 = (2373 - 15b + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373^2 - 15b + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 40)(2373 + 15b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373 - 15b + 
+<s><bot>Since $b$ is a multiple of $2373$, we can write $b^2 + 13b + 40 = (2373 + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 13b + 40 = 2373^2 - 15b + 40$. Since $b$ is a multiple of $2373$, we can write $b^2 + 13b + 40 = (2373 - 15b + 40)(2373 - 13b + 40)$. Expanding the right side, we get $2373^2 - 15b + 40 = (2373^2 - 15b + 40)(2373 - 13b + 40)$...
 
 1: <s><user><s><user>Given that $b$ is a multiple of $2373$, find the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$. You could think it step by step.</s>
 <s><bot>**
@@ -224,7 +224,253 @@ Thus, the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$ is $\boxed{225
 可以看出，cot形式输出的整体格式好了不少，但答案依旧是错的，整体还是受限于模型的训练语料规模
 
 ### DPO
+**Datasets**&emsp; 在DPO阶段，Sophie0使用了BAAI的[Infinity-Preference](https://www.modelscope.cn/datasets/BAAI/Infinity-Preference)数据集以及Magpie-Align的[Llama3.1_DPO](https://huggingface.co/datasets/Magpie-Align/Magpie-Llama-3.1-Pro-DPO-100K-v0.1)数据集，前者包含有59.3k对偏好数据，后者则直接基于Llama 3.1 70B Instruct采样了约100k对偏好数据，均为单轮问答
 
+**Settings**&emsp; 参考SFT阶段的varlen切分，DPO阶段同样使用varlen算子，并保证每一batch中以(prompt + max(正例，负例))计算的总token数上界不超过0.25M。DPO阶段仅使用4张vGPU-32G进行训练，因此梯度累积扩大为16步，即每一步有16k个token均分至4张GPU。DPO阶段为避免过拟合与训练稳定，参考已有的工作与开源项目，学习率上界设置为5e-7，训练1个epoch，更新约380步，总耗时约1.2h，开销约8.2RMB
+
+此外，考虑到已有工作中提到的DPO训练时正负样例选择概率同时下降的问题，参考[此篇总结](https://zhuanlan.zhihu.com/p/698852522)以及另一篇工作[^liu2024RPO]，Sophie0采用了类似于RPO的损失项：
+$$
+\mathcal{L}_{DPO}(\pi_\theta; \pi_{ref}) = -\mathbb{E}_{(x, y_w, y_l)\sim D}\left[\log \sigma \left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)}-\beta\log\frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right) + \beta\log\pi_\theta(y_w|x)\right]
+$$
+也就是将正例的SFT损失加入至原始的偏好损失，从而约束$\pi_\theta$的正例输出概率上升。为了简化调参，该损失的倍率直接套用DPO的$\beta$
+
+**Results**&emsp; 首先是DPO训练期间的loss曲线与reward曲线
+
+<figure>
+<img src="fig/dpo_padding/chosen_reward.png" height=150/>
+<img src="fig/dpo_padding/reject_reward.png" height=150/>
+<img src="fig/dpo_padding/dpo_loss.png" height=150/>
+<img src="fig/dpo_padding/sft_loss.png" height=150/>
+<img src="fig/dpo_padding/chosen_win.png" height=150/>
+</figure>
+
+可以发现，由于SFT损失项的约束，Sophie0在DPO过程中并没有出现明显的正例概率下降问题，即`chosen_reward`维持在了0附近，也就是说正例的选择概率与$\pi_{ref}$类似，对应的`chosen_win`也正好保持在了50%附近。而负例的reward则稳定下降，整体的偏好损失正常下降，而作为约束项的SFT loss则缓慢上升。整体曲线趋势与之前的一些工作相似。由于DPO阶段仅训练了1个epoch，因此也不需要考虑在后续epoch中的过拟合问题
+
+另外值得注意的是，DPO阶段对batch size的要求不低，Sophie0在初始尝试的时候使用了约0.15M tokens的batch size，此时偏好loss的曲线出现明显震荡，最终模型的正常生成能力也被破坏，因此需要足够多对正负例样本来引导模型在每一步的更新
+
+除去loss曲线外，经过DPO阶段后模型的输出结果如下：
+```
+0: <s><user>请问你是由谁训练研发的呢？</s>
+<s><bot>你好！我是基于深度学习的人工智能模型，由OpenAI开发，旨在开发能够理解、生成和生成自然语言文本的智能客服系统。以下是我为您提供的训练计划：
+1. 数据预处理：首先，需要对数据进行清洗、分词、去除停用词、词干提取、词形还原等操作，以便后续的分析和标注。
+2. 模型训练：使用TensorFlow或PyTorch等深度学习框架进行模型训练，以便模型能够理解和生成自然语言文本。
+3. 模型评估：使用测试集对模型进行评估，评估模型的准确性和泛化能力。
+4. 应用：将训练好的模型应用于实际应用中，如语音识别、机器翻译、推荐系统等。
+5. 用户测试：将测试结果反馈给用户，并根据反馈不断优化模型。
+6. 持续改进：根据反馈不断优化模型，不断优化模型，提高其准确性和
+1: <s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>Transformer（Generative Adversarial Networks，GPT）是计算机视觉和自然语言处理领域中的一个重要技术，用于处理图像和视频。它通过生成模型来生成高质量的图像，并通过学习生成模型来生成高质量的图像。
+Transformer的架构如下：
+1. 生成模型：GAN（Generative Adversarial Networks）是生成器，它由多个层（前馈神经网络）组成，这些层通过生成网络（如卷积神经网络）来生成图像。GAN在生成图像方面表现非常出色，能够生成高质量的图像。
+2. 训练：GAN在生成图像时会进行一些微调，如裁剪、裁剪、缩放等，以提高图像质量。GAN在生成图像时会进行一些微调，如裁剪、缩放、缩放、缩放等，以提高图像质量。
+3. 生成：GAN在生成图像时会进行一些微调�
+2: <s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot>Certainly! Here's a C++ example for quick sort:
+
+```cpp
+#include <iostream>
+#include <vector>
+
+using namespace std;
+
+int main() {
+    int n;
+    cout << "Enter a positive integer: ";
+    cin >> n;
+    for (int i = 0; i < n; i++) {
+        cout << i << " ";
+    }
+    cout << endl;
+    return 0;
+}
+```
+
+In this code, we define a function `cache` that takes a positive integer `n` as input. Inside the function, we initialize an empty vector `cout` to store the elements of the array `n`. We then use a `for` loop to iterate `n` times, updating the `i` value of `n` with the current element `i` in the vector. Finally, we return the `cout` vector.
+
+In the `main` function, we declare an integer `n` and assign it the value of `n` to it. We then call the `cache` function with `n` as the argument and store the returned vector in the `cache` vector.
+
+When you run this program, it will output: `200
+3: <s><user>能否介绍一下中国的首都呢？</s>
+<s><bot>中国首都位于中国的首都，是中国政治、经济、文化、科技、科技、文化、体育和文化中心。它是中国最重要的城市之一，也是世界著名的历史文化名城之一。
+北京位于中国的首都，是中国重要的国际贸易中心，也是中国重要的国际贸易中心。北京是中国重要的国际贸易中心，也是中国最重要的国际贸易中心之一。
+北京是中国的首都，也是中国最重要的国际贸易中心之一。它位于中国的首都，也是中国重要的国际贸易中心之一。
+北京的历史可以追溯到16世纪，当时，中国的首都是北京。在19世纪，北京成为了一个重要的国际贸易中心，并成为了中国最重要的国际贸易中心之一。
+除了北京以外，北京还是中国重要的国际贸易中心之一。它位于中国的首都，也是中国重要的国际贸易中心之一。</s>
+4: <s><user>Could you please tell me a joke about the weather?</s>
+<s><bot>Why did the weather change the weather? Because it was so cold that it was like a cold breeze.</s>
+```
+
+整体上来看，相较于SFT后的模型，DPO对小模型的增益似乎并不明显，可能需要使用专门的偏好数据集进行验证
+
+### GRPO + Reasoning
+*Comming soon, 由于模型规模较小，预计使用一半的reasoning数据集先进行SFT以对齐格式*
+
+
+### 变长推理
+**Background**&emsp; 在单人用户对话中，LLM可能仅需要处理batch = 1的情况，但在跑benchmark或多用户场景，对batch inference的支持能够极大的提升GPU的利用率。一般来说，batch inference仅需要对输入的token进行左padding即可，但在LLM主要阶段全部使用padding-free策略进行训练的情况下，模型会难以处理很少见到的<pad> token，导致注意力无法正确关注到正文内容。即使在将pad token替换为eos token后仍然难以缓解该问题。
+
+作为示例，模型的输入选择了一些短问题 + 长段的数学CoT，对应的batch inference结果如下：
+```
+0: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>**Respondue:**
+
+**Issue:** **Issue:** **Issue:**...
+1: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot>**Issue: Ensure the Invalid Code (PAT)**
+
+**Issue: Easier to C++**
+
+**Issue: Easier to C++**
+
+**Issue: Easier to C++**
+...
+2: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>Could you please tell me a joke about the weather?</s>
+<s><bot>Certainly, here's a list of common concerns:
+
+1. **Temperature Issues**:
+   - **Temperature Issues**: Toxic (high) and temperature (high).
+   ...
+3: <s><user><s><user>Given that $b$ is a multiple of $2373$, find the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$. You could think it step by step.</s>
+<s><bot>To determine the greatest common divisor (GCD) of $b^2 + 13b + 40$ and $b + 5$, we follow these steps:
+
+1. **Identify the GCD of $b^2 + 13b + 40$:**
+   - The prime factorization of $b^2 + 13b + 40$ is $b^2 + 13b + 40$.
+   - Therefore, the GCD of $b^2 + 13b + 40$ and $b + 5$ is $b^2 + 13b + 40$.
+
+2. **Express $b^2 + 13b + 40$ in terms of $b$:**
+   - We start by expressing $b^2 + 13b + 40$ in terms of $b$ using the difference of squares formula:
+     \[
+     b^2 + 13b + 40 = (b + 5)(b - 2)
+     \]
+   - We then apply the difference of squares formula:
+     \[
+     (b + 5)(b - 2) = b^2 + 2b + 2
+     \]
+   - Rearrange to isolate $b^2 + 2b + 2$:
+     \[
+     b^2 + 2b + 2 = b^2 + 2b + 2 - b^2 - 2b + 2 = b^2 + 2b - 2b + 1
+     \]
+   - Further simplification gives:
+     \[
+     b^2 + 2b - 2b + 1 = 1
+     \]
+
+3. **Factorize $b^2 + 13b + 40$:**
+   - We now have:
+     \[
+     b^2 + 13b + 40 = 1 + 13b + 40
+     \]
+   - To find the GCD, we need to find the values of $b$ that make the expression $1 + 13b + 40$ a multiple of $3$.
+
+4. **Solve the equation:**
+   ...
+```
+
+可以发现，在<pad>占据主要输入的情况下，模型的输出内容受到了明显影响，仅有不包含<pad>的数学CoT回答仍然保持正常。
+
+将tokenizer的<pad>替换为结束符，对应的输出结果如下：
+```
+0: </s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s><s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>提创意的「�家。年迈时，</s>
+1: </s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s><s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot>茙�，</s>
+2: </s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s></s><s><user>Could you please tell me a joke about the weather?</s>
+<s><bot>治育活２
+
+新新饮用等社交软件。�和。�和，</s>
+```
+
+可以发现，模型虽然能够正确预测结束符，但是输出内容同样受到了影响。
+
+为了解决这个问题，Sophie0在Huggingface的GenerateMixin，Cache框架下额外实现了兼容varlen inference的流程。作为测试，我选择了相同的生成参数，仅将与varlen inference关联的`use_varlen_inference`打开，对应的生成结果如下：
+```
+0: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>Transformer架构（Generative Adversarial Networks，GAN）是一种基于Transformer架构的神经网络架构，它通过一个卷积神经网络（GAN）来生成输出、预测和生成输出。GAN架构通过一个卷积层（Convolution）层，将输入的输入转换为输入输出，再通过一个卷积层来生成输出。GAN架构的核心是损失函数，它将输入的输出映射到输入层，然后通过损失函数将输出映射到输出层，最终输出输出。
+GAN架构的基本思想是通过一个卷积层来生成输出，并将输出映射到输出层。GAN架构的核心是损失函数，它将输出映射到输出层，然后通过损失函数将输出映射到输出层，最终输出输出。
+Transformer架构在图像识别、语音识别、自然语言处理、推荐系统等多个领域中发挥着重要作用。</s>
+1: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot>Certainly! The C++ example for quick sort is as follows:
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
+// Function to sort elements of a vector
+vector<int> sort(vector<int>& arr) {
+    for (int i = 0; i < arr.size(); i++) {
+        for (int j = 0; j < arr[i].length; j++) {
+            if (arr[j] > arr[i]) {
+                arr[j] = arr[i];
+                arr[i] = arr[j];
+            }
+        }
+    }
+}
+
+int main() {
+    vector<int> arr = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    sort(arr);
+    return 0;
+}
+```
+
+In this example, we define a function `sort` that takes an array (`arr`) and an integer (`arr[i]`) as input. Inside the function, we use the `std::sort` function to sort the elements of the array. The `sort` function takes three parameters: `arr`, `arr`, and `arr[i]`. 
+
+The `sort` function takes three parameters: `i`, `j`, and `arr[i]`. It compares the elements at indices `i` and `j` in the array and assigns the corresponding values to `arr[i]` and `arr[j]`. The `sort` function is then used to sort the array in ascending order.
+
+By using this code, you can easily sort any given array in ascending order.</s>
+2: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>Could you please tell me a joke about the weather?</s>
+<s><bot>Why did the weather go to ruin the town? Because it had a very cold winter, the weather was a constant.</s>
+3: <s><user><s><user>Given that $b$ is a multiple of $2373$, find the greatest common divisor of $b^2 + 13b + 40$ and $b + 5$. You could think it step by step.</s>
+<s><bot>To determine the greatest common divisor (gcd) of \(b^2 + 13b + 40\) and \(b + 5\):
+
+1. **Identify the GCD of the two numbers:**
+   - The greatest common divisor (GCD) of \(b^2 + 13b + 40\) and \(b + 5\) is given by \(b^2 + 13b + 40\).
+   - Here, \(b = 2373\).
+   - Thus, the GCD is \(2373\).
+
+2. **Apply the Euclidean Algorithm:**
+   - Apply the Euclidean algorithm to find the GCD:
+     \[
+     \text{GCD}(2373, 2373) = 2373
+     \]
+   - Calculate \(2373\):
+     \[
+     2373 = 2 \times 3 \times 7 \times 13
+     \]
+     \[
+     2373 = 6 \times 7 \times 13
+     \]
+     \[
+     2373 = 429 \times 13
+     \]
+     \[
+     2373 = 1199 \times 13
+     \]
+     \[
+     1199 = 13 \times 13
+     \]
+     \[
+     1199 = 13 \times 23
+     \]
+     ...
+```
+
+可以发现，varlen inference保证了模型对batch中短prompt输出的正确处理，证明了其有效性
+
+**Implementation**&emsp; 为了兼容Huggingface的主框架，varlen inference的外部输入需与原始框架完全一致，而对应的序列索引等信息则需要在推理时实时生成。其主要的改动点集中在以下几个地方：
+
+- `prepare_inputs_for_generation`: 在该函数中，Sophie0需要生成当前步中对应query的`cu_seqlens`，并在最开始的prefill阶段将prompt转换为padding-free形式(直接使用flash_attention的相关函数)
+- `VarlenCache`: 在该类中，Sophie0需要维护varlen形式的KV Cache以及KV的`cu_seqlens`，同时负责将当前新的KV插入到之前的Cache对应的位置中
+- `Attention`: 在注意力层，Sophie0使用与训练时一致的varlen attention算子，不过需要注意query和KV对应着不同的序列索引
+- `Output`: 在得到模型的当前步输出后，需要通过`cu_seqlens`提取出每个序列最后的token，作为当前步生成的新token
+
+通过以上步骤，Sophie0即可使用varlen attention算子以padding-free形式处理不定长数据的batch inference
 
 ### References
-[^sardana2024ChinchillaOptimal]: Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws. Sardana, Nikhil, et al. ICML'24, https://openreview.net/forum?id=0bmXrtTDUu
+[^sardana2024ChinchillaOptimal]: Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws. Sardana, Nikhil, et al. ICML'24.
+
+[^liu2024RPO]: Provably Mitigating Overoptimization in RLHF: Your SFT Loss is Implicitly an Adversarial Regularizer. Zhihan Liu, et al. NeurIPS'24.

@@ -16,6 +16,8 @@ from flash_attn.ops.triton.layer_norm import RMSNorm
 from flash_attn.modules.mlp import GatedMlp
 from flash_attn.losses.cross_entropy import CrossEntropyLoss
 from einops import rearrange
+from itertools import chain
+from flash_attn.bert_padding import unpad_input
 
 from .configuration_sophie0 import Sophie0Config
 from transformers.modeling_utils import PreTrainedModel
@@ -164,6 +166,147 @@ class Cache(transformers.cache_utils.Cache):
                 cache.states.append(past_key_values[layer_idx])
         return cache
 
+class VarlenCache(transformers.cache_utils.Cache):
+    """
+    A cache used for storing hidden states produced by varlen batch inference.
+
+    **Input:**
+        - attn_state: Cache for standard attention, tuple(size(bsz * k_len/v_len, dmodel) * 2)
+    """
+
+    is_compileable = True
+
+    def __init__(self, cache_position: int = 0, batch_size: int = 1, device: str | torch.device = None):
+        super().__init__()
+
+        self.states: List[Dict[str, Any]] = []
+        self._cache_position = [torch.full((batch_size,), cache_position, dtype=torch.int64, device=device)] # Used in `generate` to keep tally of how many tokens the cache has seen
+        self.batch_size =  batch_size
+        self.device = device
+
+    def __getitem__(self, layer_idx: int) -> Dict[str, Any]:
+        if layer_idx < len(self):
+            return self.states[layer_idx]
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+
+    def __iter__(self):
+        for state in self.states: yield state
+
+    def __len__(self):
+        return len(self.states)
+
+    def update(
+        self,
+        attn_state: Tuple[torch.Tensor, torch.Tensor] = None,
+        cu_seqlens: torch.LongTensor = None,
+        layer_idx: int = 0,
+        cache_kwargs: Optional[Dict[str, Any]] = {},
+    ) -> Dict[str, Any]:
+        """
+        Updates the cache with the new `attn_state` for the layer `layer_idx`.
+
+        Args:
+            attn_state (`Tuple[torch.Tensor, torch.Tensor]`, `optional`):
+                The new attention key/value states to cache, sizes (bsz * seqlen, hidden_size)
+            cu_seqlens (`torch.LongTensor`):
+                the accumulated sequence length for current states, sizes (bsz + 1,)
+            layer_idx (`int`, defaults to 0):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass.
+
+        Return:
+            Dictionary of the updated state.
+        """
+
+        # Update the number of seen tokens
+        if len(self._cache_position) <= layer_idx:
+            self._cache_position.append(
+                torch.zeros((cu_seqlens.size(0) - 1,), dtype=torch.int64, device=cu_seqlens.device)
+            )
+
+        kv_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        self._cache_position[layer_idx] += kv_seqlens
+
+        if attn_state is not None:
+            if not isinstance(attn_state, Tuple) or len(attn_state) != 2:
+                raise ValueError("`attn_state` must be a tuple of two tensors for key/value states")
+            
+        if len(self.states) <= layer_idx:
+            state = dict(
+                attn_state=attn_state,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=kv_seqlens.max().item()
+            )
+            self.states.append(state)
+        else:
+            # append current steps states (bsz * 1, hidden_size) into kv_cache (bsz * seqlen, hidden_size)
+            state = self.states[layer_idx]
+            if attn_state is not None:
+                if state['attn_state'] is not None:
+                    key_state, value_state = attn_state # new kv
+                    key_cache, value_cache = state['attn_state'] # old kv
+                    kv_cu_seqlens = state['cu_seqlens']
+                    old_kv_seqlens = kv_cu_seqlens[1:] - kv_cu_seqlens[:-1]
+
+                    # split -> chain -> concat
+                    key_cache, value_cache = list(map(lambda x: torch.split(x, old_kv_seqlens.tolist()), [key_cache, value_cache]))
+                    key_state, value_state = list(map(lambda x: torch.split(x, kv_seqlens.tolist()), [key_state, value_state]))
+
+                    key_cache = list(chain(*[[_raw, _new] for _raw, _new in zip(key_cache, key_state)]))
+                    value_cache = list(chain(*[[_raw, _new] for _raw, _new in zip(value_cache, value_state)]))
+                    key_cache, value_cache = list(map(lambda x: torch.cat(x), [key_cache, value_cache]))
+                    new_cu_seqlens = cu_seqlens + kv_cu_seqlens
+
+                    attn_state = (key_cache, value_cache)
+
+                state['attn_state'] = attn_state
+                state['cu_seqlens'] = new_cu_seqlens
+                state['max_seqlen'] = (new_cu_seqlens[1:] - new_cu_seqlens[:-1]).max().item()
+
+        return state
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> torch.Tensor:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        if len(self.states) <= layer_idx:
+            return torch.zeros(self.batch_size, dtype=torch.int64, device=self.device)
+        return self._cache_position[layer_idx]
+    
+    def get_cu_seq_length(self, layer_idx: Optional[int] = 0) -> torch.Tensor:
+        """Returns the accumulated sequence length of the cached states. A layer index can be optionally passed."""
+        if len(self.states) <= layer_idx:
+            return torch.zeros(self.batch_size + 1, dtype=torch.int64, device=self.device)
+        return self.states[layer_idx]['cu_seqlens']
+
+    def get_max_length(self) -> Optional[int]:
+        """Returns the maximum sequence length of the cached states. Cache does not have a maximum length."""
+        return None
+
+    def to_legacy_cache(self) -> Tuple:
+        return tuple(self.states)
+    
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorders the cache for beam search, given the selected beam indices."""
+        raise NotImplementedError("Varlen Batch Inference does not support beam search at now.")
+
+    @classmethod
+    @torch.compiler.disable
+    def from_legacy_cache(
+        cls,
+        past_key_values: Optional[Tuple] = None,
+        cache_position: int = 0,
+        batch_size: int = 1,
+        device: str | torch.device = None
+    ):
+        """Converts a cache in the legacy cache format into an equivalent `Cache`."""
+
+        cache = cls(cache_position, batch_size=batch_size, device=device)
+        if isinstance(past_key_values, list):
+            for layer_idx in range(len(past_key_values)):
+                cache.states.append(past_key_values[layer_idx])
+        return cache
+
 @torch.no_grad()
 def linear_init(
     linear: nn.Linear,
@@ -238,7 +381,7 @@ class FullAttention(nn.Module):
         for k, v in self.named_modules():
             if isinstance(v, nn.Linear): linear_init(v, zero_bias=True)
     
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor=None, max_seqlen: int=None, causal: bool=True, past_key_values: Cache=None):
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor=None, max_seqlen: int=None, causal: bool=True, past_key_values: Cache | VarlenCache=None):
         """
         Training with varlen:
 
@@ -282,17 +425,38 @@ class FullAttention(nn.Module):
             qkv = rearrange(qkv, "L (H D) -> L H D", H=(self.num_q_heads + 2 * self.num_kv_heads), D=self.head_size)
             q, k, v = torch.split(qkv, [self.num_q_heads, self.num_kv_heads, self.num_kv_heads], dim=-2)
 
-            assert past_key_values is None
+            if past_key_values is not None:
+                assert isinstance(past_key_values, VarlenCache)
 
-            self.rotary._update_cos_sin_cache(seqlen=max_seqlen, device=q.device, dtype=q.dtype)
-            q, k = apply_rotary_emb(q, self.rotary._cos_cached, self.rotary._sin_cached, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen),\
-                apply_rotary_emb(k, self.rotary._cos_cached, self.rotary._sin_cached, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+                _seqlen = cu_seqlens[1:] - cu_seqlens[:-1]
+                _max_seqlen = (seqlen_offset + _seqlen).max().item()
 
-            out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=self.dropout if self.training else 0, causal=causal)
+                self.rotary._update_cos_sin_cache(seqlen=_max_seqlen, device=q.device, dtype=q.dtype)
+                q, k = apply_rotary_emb(q, self.rotary._cos_cached, self.rotary._sin_cached, seqlen_offsets=seqlen_offset, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen),\
+                    apply_rotary_emb(k, self.rotary._cos_cached, self.rotary._sin_cached, seqlen_offsets=seqlen_offset, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                
+                new_cache = past_key_values.update(
+                    attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
+                    cu_seqlens=cu_seqlens,
+                    layer_idx=self.layer_idx,
+                    cache_kwargs=dict()
+                )
+                k, v = new_cache['attn_state']
+                k, v = rearrange(k, "... (H D) -> ... H D", H=self.num_kv_heads, D=self.head_size), rearrange(v, "... (H D) -> ... H D", H=self.num_kv_heads, D=self.head_size)
+
+                kv_cu_seqlens, kv_max_seqlen = new_cache['cu_seqlens'], new_cache['max_seqlen']
+
+                out = flash_attn_varlen_func(q, k, v, cu_seqlens, kv_cu_seqlens, max_seqlen, kv_max_seqlen, dropout_p=self.dropout if self.training else 0, causal=causal)
+            else:
+                self.rotary._update_cos_sin_cache(seqlen=max_seqlen, device=q.device, dtype=q.dtype)
+                q, k = apply_rotary_emb(q, self.rotary._cos_cached, self.rotary._sin_cached, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen),\
+                    apply_rotary_emb(k, self.rotary._cos_cached, self.rotary._sin_cached, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+                out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=self.dropout if self.training else 0, causal=causal)
             out = self.out(rearrange(out, "L H D -> L (H D)"))
 
         return out, None, past_key_values
-
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: Sophie0Config, layer_idx: int):
@@ -375,7 +539,7 @@ class Sophie0Model(Sophie0PretraindModel):
         max_seqlen: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Union[Cache, VarlenCache, List[torch.FloatTensor]]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -395,7 +559,10 @@ class Sophie0Model(Sophie0PretraindModel):
             inputs_embeds = self.embeddings(input_ids)
         hidden_states = inputs_embeds
 
-        if use_cache and not isinstance(past_key_values, Cache): past_key_values = Cache.from_legacy_cache(past_key_values)
+        if cu_seqlens is not None:
+            if use_cache and not isinstance(past_key_values, VarlenCache): past_key_values = VarlenCache.from_legacy_cache(past_key_values, batch_size=cu_seqlens.size(0)-1, device=cu_seqlens.device)
+        else:
+            if use_cache and not isinstance(past_key_values, Cache): past_key_values = Cache.from_legacy_cache(past_key_values)
 
         if kwargs.get("use_gradient_checkpoint", False) is True and self.supports_gradient_checkpointing and self.training: self.gradient_checkpointing_enable()
         else: self.gradient_checkpointing = False
@@ -483,13 +650,25 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
         cache_position: Optional[int] = None,
         use_cache: Optional[bool] = True,
         logits_to_keep = None,
+        cu_seqlens: Optional[torch.LongTensor] = None,
+        max_seqlen: Optional[int] = None,
+        use_varlen_inference: Optional[bool]=False,
         **kwargs
     ):
-        if past_key_values is not None and len(past_key_values) > 0:
-            input_ids = input_ids[:, -1:]
         if inputs_embeds is not None and len(past_key_values) == 0:
             model_inputs = {'inputs_embeds': inputs_embeds}
         else:
+            if past_key_values is not None and len(past_key_values) > 0:
+                input_ids = input_ids[:, -1:]
+                if isinstance(past_key_values, VarlenCache):
+                    input_ids = input_ids.squeeze(-1)
+                    cu_seqlens = torch.arange(past_key_values.batch_size + 1, dtype=torch.int32, device=input_ids.device)
+                    max_seqlen = 1
+            else:
+                if use_varlen_inference:
+                    input_ids, _, cu_seqlens, max_seqlen, _ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                    input_ids = input_ids.squeeze(-1)
+            
             model_inputs = {'input_ids': input_ids.contiguous()}
         
         if logits_to_keep is not None:
@@ -498,7 +677,8 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
         model_inputs.update({
             'past_key_values': past_key_values,
             'use_cache': use_cache,
-            'attention_mask': attention_mask
+            'cu_seqlens': cu_seqlens,
+            'max_seqlen': max_seqlen
         })
         return model_inputs
     
@@ -507,9 +687,10 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
         input_ids: Optional[torch.LongTensor] = None,
         cu_seqlens: Optional[torch.LongTensor] = None,
         max_seqlen: Optional[int] = None,
+        use_varlen_inference: Optional[bool]=False,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Union[Cache, VarlenCache, List[torch.FloatTensor]]] = None,
         labels: Optional[torch.LongTensor] = None,
         labels_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
@@ -538,6 +719,7 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
 
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
+        past_key_values = outputs.past_key_values
 
         loss = None
         if labels is not None:
@@ -563,6 +745,12 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
                 else:
                     loss = loss.mean()
         
+        else:
+            if isinstance(past_key_values, VarlenCache):
+                kv_cu_seqlens = past_key_values.get_cu_seq_length()
+                if logits.size(0) > past_key_values.batch_size: logits = logits.index_select(0, kv_cu_seqlens[1:] - 1)
+                logits = logits.unsqueeze(1)
+        
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -570,9 +758,7 @@ class Sophie0ForCausalLM(Sophie0PretraindModel, GenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
+            past_key_values=past_key_values,
             hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            attentions=outputs.attentions
         )
-
-

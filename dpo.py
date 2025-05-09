@@ -26,6 +26,8 @@ from transformers import AutoTokenizer, PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from copy import deepcopy
 from torch_scatter import scatter
+from flash_attn.losses.cross_entropy import CrossEntropyLoss
+from torchmetrics import MeanMetric
 
 from model.modeling_sophie0 import Sophie0ForCausalLM
 from model.configuration_sophie0 import Sophie0Config
@@ -58,30 +60,25 @@ class DPODataset(torch.utils.data.Dataset):
             batch_size=5000,
             num_proc=32,
             remove_columns=datas.column_names,
-            load_from_cache_file=False,
+            load_from_cache_file=True,
             cache_file_name=os.path.join(HF_CACHE, "parquet/dpo/dpo_map.cache")
         )
     
     def _preprocess(self, raw):
-        texts = []
-        
         pair_cache = []
-        for conversations in [raw["chosen"], raw["rejected"]]:
-            texts = []
-            for conversation in conversations:
-                cache = ""
-                # only select one-turn conversation
-                if len(conversation) < 2: continue
-                if conversation[0]['role'] != 'user' or conversation[1]['role'] != 'assistant': continue
 
-                cache = f"<s><user>{conversation[0]['content']}</s>\n" + f"<s><bot>{conversation[1]['content']}</s>"
-                texts.append(cache)
-            
-            outputs = self.tokenizer(texts, add_special_tokens=False)['input_ids']
-            pair_cache.append(outputs)
+        for chosen, rejected in zip(raw["chosen"], raw["rejected"]):
+            if chosen[1]["role"] == "assistant" and rejected[1]["role"] == "assistant" and chosen[0]["role"] == "user":
+                prompt = chosen[0]["content"]
+                chosen_input = f"<s><user>{prompt}</s>\n<s><bot>{chosen[1]["content"]}</s>\n"
+                rejected_input = f"<s><user>{prompt}</s>\n<s><bot>{rejected[1]["content"]}</s>\n"
+                chosen_input, rejected_input = self.tokenizer([chosen_input, rejected_input], add_special_tokens=False).input_ids
+
+                if max(len(chosen_input), len(rejected_input)) > self.train_config.max_token_per_batch: continue
+                pair_cache.append([chosen_input, rejected_input])
         
-        texts.clear()
-        
+        # manage varlen mini-batch
+        texts = []
         chosen_batch_length, rejected_batch_length = 0, 0
         chosen_cache, rejected_cache = [], []
         for chosen, rejected in zip(pair_cache[0], pair_cache[1]):
@@ -105,38 +102,44 @@ class DPODataset(torch.utils.data.Dataset):
     def process(self, indices: list[int]):
         chosen, rejected = self.datas.select(indices)["input_ids"][0]
 
-        # generate varlen inputs
-        results = {"chosen": None, "rejected": None}
-        for split, data in zip(["chosen", "rejected"], [chosen, rejected]):
-            input_ids, labels = data, deepcopy(data)
-            cu_seqlens, max_seqlen = [0], 0
-            for i in range(len(input_ids)):
-                # replace labels with <pad> except for the bot reply
-                is_bot_reply = False
-                for j in range(len(labels[i])):
-                    if labels[i][j] == self.model_config.bot_token_id: is_bot_reply = True
-                    elif labels[i][j] == self.model_config.eos_token_id:
-                        if not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
-                        is_bot_reply = False
-                    elif not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
+        input_ids: List = chosen + rejected
+        labels = deepcopy(input_ids)
+        cu_seqlens, max_seqlen = [0], 0
+        response_length = []
 
-                input_ids[i] = input_ids[i][:-1]
-                labels[i] = labels[i][1:]
-                max_seqlen = max(max_seqlen, len(input_ids[i]))
-                cu_seqlens.append(cu_seqlens[-1] + len(input_ids[i]))
+        for i in range(len(input_ids)):
+            # replace labels with <pad> except for the bot reply
+            is_bot_reply = False
+            for j in range(len(labels[i])):
+                if labels[i][j] == self.model_config.bot_token_id:
+                    is_bot_reply = True
+                    if j > 0: labels[i][j - 1] = self.model_config.bos_token_id
+                elif labels[i][j] == self.model_config.eos_token_id:
+                    if not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
+                    is_bot_reply = False
+                elif not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
+
+            input_ids[i] = input_ids[i][:-1]
+            labels[i] = labels[i][1:]
+            max_seqlen = max(max_seqlen, len(input_ids[i]))
+            cu_seqlens.append(cu_seqlens[-1] + len(input_ids[i]))
+
+            response_length.append((np.array(labels[i], dtype=int) != self.model_config.pad_token_id).sum().item())
             
-            input_ids = torch.tensor(list(chain(*input_ids)), dtype=torch.int64)
-            labels = torch.tensor(list(chain(*labels)), dtype=torch.int64)
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        input_ids = torch.tensor(list(chain(*input_ids)), dtype=torch.int64)
+        labels = torch.tensor(list(chain(*labels)), dtype=torch.int64)
+        rejected_start = cu_seqlens[((len(cu_seqlens)-1) // 2)]
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        response_length = torch.tensor(response_length, dtype=torch.int64)
 
-            results[split] = dict(
-                input_ids=input_ids,
-                labels=labels,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen
-            )
-
-        return results
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            rejected_start=rejected_start,
+            response_length=response_length
+        )
 
     def __getitem__(self, idx: int):
         return idx
@@ -170,31 +173,42 @@ class DPODataModule(LightningDataModule):
 #                  --- model ---
 #########################################################
 class DPOModule(LightningModule):
-    def __init__(self, tokenizer: AutoTokenizer, model: PreTrainedModel, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
+    def __init__(self, tokenizer: AutoTokenizer, model: PreTrainedModel, ref_model: PreTrainedModel, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
         super().__init__(**kwargs)
 
         self.tokenizer = tokenizer
         self.model = model
+        self.ref_model = ref_model
         self.model_config = model_config
         self.train_config = train_config
 
-        # copy a reference model
-        self.ref_model = deepcopy(self.model)
+        self.ref_model.eval()
+        self.ref_model.requires_grad_(False)
 
         self._date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self._train_tokens = 0
 
         self.save_hyperparameters(train_config)
     
-    @rank_zero_only
+    # @rank_zero_only
     def on_fit_start(self):
-        print(f"--------------- Settings ---------------")
-        for (k, v) in self.hparams.items(): print(f"{k}:\t {v}")
-        print(f"------------- Architecture -------------")
-        print(self.model)
-        print(f"Total Param: {sum([p.numel() for p in self.model.parameters()])}")
-        print(f"------------ Start Training ------------")
-        self._start = time.perf_counter()
+        if self.trainer.global_rank == 0:
+            print(f"--------------- Settings ---------------")
+            for (k, v) in self.hparams.items(): print(f"{k}:\t {v}")
+            print(f"------------- Architecture -------------")
+            print(self.model)
+            print(f"Total Param: {sum([p.numel() for p in self.model.parameters()])}")
+            print(f"------------ Start Training ------------")
+            self._start = time.perf_counter()
+        
+        # metrics
+        self.train_metrics = {
+            "preference_loss": MeanMetric().to(self.trainer.strategy.root_device),
+            "sft_loss": MeanMetric().to(self.trainer.strategy.root_device),
+            "chosen_win": MeanMetric().to(self.trainer.strategy.root_device),
+            "chosen_reward": MeanMetric().to(self.trainer.strategy.root_device),
+            "rejected_reward": MeanMetric().to(self.trainer.strategy.root_device)
+        }
     
     # @rank_zero_only
     def on_fit_end(self):
@@ -235,9 +249,6 @@ class DPOModule(LightningModule):
         scheduler.step()
     
     def configure_model(self):
-        self.ref_model.eval()
-        self.ref_model.requires_grad_(False)
-
         self.model = wrap(self.model, device_id=self.trainer.strategy.root_device)
         self.ref_model = wrap(self.ref_model, device_id=self.trainer.strategy.root_device)
     
@@ -264,11 +275,8 @@ class DPOModule(LightningModule):
         logits = hidden_state.log_softmax(dim=-1)
         labels = input_datas["labels"]
         cu_seqlens = input_datas["cu_seqlens"]
-        actual_logits = torch.gather(logits, dim=-1, index=input_datas["labels"].unsqueeze(-1))[..., 0]
+        actual_logits = torch.gather(logits, dim=-1, index=input_datas["labels"].unsqueeze(-1)).squeeze(-1)
         actual_logits[labels == self.model_config.pad_token_id] = 0
-
-        # actual_logits = actual_logits.sum() / (labels != self.model_config.pad_token_id).sum()
-        # return actual_logits
 
         # scatter the valid token
         batch_length = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -277,51 +285,31 @@ class DPOModule(LightningModule):
         scatter_index[labels == self.model_config.pad_token_id] = 0
 
         # index=0 is the ignore tokens
-        actual_logits = scatter(actual_logits, scatter_index, dim=-1, dim_size=batch_length.size(0) + 1, reduce="sum")
-        return actual_logits[1:]
+        actual_logits = scatter(actual_logits, scatter_index, dim=-1, dim_size=batch_length.size(0) + 1, reduce="sum")[1:]
+        chosen_logits, rejected_logits = actual_logits.chunk(2)
+        return chosen_logits, rejected_logits
 
     def forward(self, data: Dict):
         # DPO forward
-        chosen, rejected = data["chosen"], data["rejected"]
+        # policy model output
+        policy_outputs: CausalLMOutputWithPast = self.model(
+            input_ids=data["input_ids"],
+            cu_seqlens=data["cu_seqlens"],
+            max_seqlen=data["max_seqlen"],
+            return_dict=True
+        )
+        policy_chosen_logits, policy_rejected_logits = self._compute_logprob(policy_outputs.logits, data)
 
         # ref model output
         with torch.no_grad():
-            ref_chosen: CausalLMOutputWithPast = self.ref_model(
-                input_ids=chosen["input_ids"],
-                labels=chosen["labels"],
-                cu_seqlens=chosen["cu_seqlens"],
-                max_seqlen=chosen["max_seqlen"],
+            ref_outputs: CausalLMOutputWithPast = self.ref_model(
+                input_ids=data["input_ids"],
+                cu_seqlens=data["cu_seqlens"],
+                max_seqlen=data["max_seqlen"],
                 return_dict=True,
                 use_cache=False
             )
-            ref_rejected: CausalLMOutputWithPast = self.ref_model(
-                input_ids=rejected["input_ids"],
-                labels=rejected["labels"],
-                cu_seqlens=rejected["cu_seqlens"],
-                max_seqlen=rejected["max_seqlen"],
-                return_dict=True,
-                use_cache=False
-            )
-
-            ref_chosen_logits, ref_rejected_logits = self._compute_logprob(ref_chosen.logits, chosen), self._compute_logprob(ref_rejected.logits, rejected)
-        
-        policy_chosen: CausalLMOutputWithPast = self.model(
-            input_ids=chosen["input_ids"],
-            labels=chosen["labels"],
-            cu_seqlens=chosen["cu_seqlens"],
-            max_seqlen=chosen["max_seqlen"],
-            return_dict=True
-        )
-
-        policy_rejected: CausalLMOutputWithPast = self.model(
-            input_ids=rejected["input_ids"],
-            labels=rejected["labels"],
-            cu_seqlens=rejected["cu_seqlens"],
-            max_seqlen=rejected["max_seqlen"],
-            return_dict=True
-        )
-        
-        policy_chosen_logits, policy_rejected_logits = self._compute_logprob(policy_chosen.logits, chosen), self._compute_logprob(policy_rejected.logits, rejected)
+            ref_chosen_logits, ref_rejected_logits = self._compute_logprob(ref_outputs.logits, data)
 
         # compute DPO loss
         chosen_reward = policy_chosen_logits - ref_chosen_logits
@@ -332,9 +320,13 @@ class DPOModule(LightningModule):
 
         chosen_win = (policy_chosen_logits > ref_chosen_logits).float().mean().detach()
 
+        # compute policy chosen SFT loss
+        sft_loss = policy_chosen_logits / data["response_length"][:(data["response_length"].size(0) // 2)]
+        sft_loss = -sft_loss.mean()
+
         outputs = dict(
             preference_loss=total_loss.mean(),
-            sft_loss=policy_chosen.loss * self.train_config.beta,
+            sft_loss=sft_loss * self.train_config.beta,
             chosen_win=chosen_win,
             chosen_reward=chosen_reward.mean().detach(),
             rejected_reward=rejected_reward.mean().detach(),
@@ -344,13 +336,18 @@ class DPOModule(LightningModule):
     def training_step(self, batch: Dict, batch_idx):
         outputs: Dict = self(batch)
 
-        self.log("preference_loss", outputs["preference_loss"], prog_bar=True, sync_dist=True)
-        self.log("sft_loss", outputs["sft_loss"], prog_bar=True, sync_dist=True)
-        self.log("chosen_win", outputs["chosen_win"], prog_bar=False, sync_dist=True, reduce_fx="mean")
-        self.log("chosen_reward", outputs["chosen_reward"], prog_bar=False, sync_dist=True, reduce_fx="mean")
-        self.log("rejected_reward", outputs["rejected_reward"], prog_bar=False, sync_dist=True, reduce_fx="mean")
-        self.log("lr", self.optimizers().optimizer.param_groups[0]["lr"], prog_bar=True)
-        self.log("steps", self.trainer.global_step, prog_bar=True, logger=False)
+        for k, v in outputs.items(): self.train_metrics[k].update(v)
+
+        if batch_idx % self.trainer.accumulate_grad_batches == 0:
+            self.log("dpo/preference_loss", self.train_metrics["preference_loss"].compute(), prog_bar=True)
+            self.log("dpo/sft_loss", self.train_metrics["sft_loss"].compute(), prog_bar=True)
+            self.log("dpo/chosen_win", self.train_metrics["chosen_win"].compute(), prog_bar=False)
+            self.log("dpo/chosen_reward", self.train_metrics["chosen_reward"].compute(), prog_bar=False)
+            self.log("dpo/rejected_reward", self.train_metrics["rejected_reward"].compute(), prog_bar=False)
+            self.log("dpo/lr", self.optimizers().optimizer.param_groups[0]["lr"], prog_bar=True)
+            self.log("dpo/steps", self.trainer.global_step, prog_bar=True, logger=False)
+        
+            for k, v in self.train_metrics.items(): v.reset()
 
         return outputs["preference_loss"] + outputs["sft_loss"]
 
@@ -393,13 +390,18 @@ def main(train_config: argparse.Namespace):
         train_config.max_token_per_batch = train_config.max_token_per_batch // trainer.accumulate_grad_batches
 
     model = Sophie0ForCausalLM(model_config)
+    ref_model = Sophie0ForCausalLM(model_config)
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(os.path.join(_dir, "model", "tokenizer"), use_fast=True, trust_remote_code=True, local_files_only=True)
     datamodule = DPODataModule(tokenizer, model_config, train_config)
 
     if train_config.max_steps == -1: train_config.max_steps = ((len(datamodule.data) + raw_batch_size - 1) // raw_batch_size) * train_config.max_epochs
 
-    if train_config.pretrained_ckpt_path != "": model.load_state_dict(torch.load(train_config.pretrained_ckpt_path, map_location='cpu', weights_only=True))
-    plmodel = DPOModule(tokenizer, model, model_config, train_config)
+    if train_config.pretrained_ckpt_path != "": 
+        _state_dict = torch.load(train_config.pretrained_ckpt_path, map_location='cpu', weights_only=True)
+        model.load_state_dict(_state_dict)
+        ref_model.load_state_dict(_state_dict)
+
+    plmodel = DPOModule(tokenizer, model, ref_model, model_config, train_config)
     trainer.fit(plmodel, datamodule=datamodule)
 
 if __name__ == "__main__":
