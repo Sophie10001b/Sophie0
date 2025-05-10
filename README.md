@@ -3,8 +3,6 @@
 <h2>单人0.5B Toy LLM项目</h2>
 </div>
 
----
-
 <div align="center">
 <h3>目录</h3>
 </div>
@@ -13,8 +11,6 @@
 - [参考资料](#参考资料)
 - [训练流程](#训练流程)
 - [推理优化](#推理优化)
-
----
 
 <div align="center">
 <h3>简介</h3>
@@ -524,6 +520,9 @@ By using this code, you can easily sort any given array in ascending order.</s>
 - `VarlenCache`: 在该类中，Sophie0需要维护varlen形式的KV Cache以及KV的`cu_seqlens`，同时负责将当前新的KV插入到之前的Cache对应的位置中
 - `Attention`: 在注意力层，Sophie0使用与训练时一致的varlen attention算子，不过需要注意query和KV对应着不同的序列索引
 - `Output`: 在得到模型的当前步输出后，需要通过`cu_seqlens`提取出每个序列最后的token，作为当前步生成的新token
+
+其核心的KV Cache 更新步骤如下图所示，通过`split` -> `chain` -> `concat`这三步将新的KV填充至cache中：
+![fig](fig/varlen_cache.png)
 
 通过以上步骤，Sophie0即可使用varlen attention算子以padding-free形式处理不定长数据的batch inference
 
