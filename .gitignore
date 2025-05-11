@@ -6,6 +6,7 @@
 /cache
 /dpo_hf*
 /dpo_padding*
+/accelerate_config.yaml
 __pycache__
 .vscode
 .DS_Store
