@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import glob
 import argparse
@@ -21,7 +22,7 @@ from lightning.pytorch.strategies import FSDPStrategy
 from lightning.pytorch.utilities import rank_zero_only
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
-from transformers import AutoTokenizer, PreTrainedModel, PretrainedConfig
+from transformers import AutoTokenizer, PreTrainedModel, PretrainedConfig, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from flash_attn.bert_padding import unpad_input
 from copy import deepcopy
@@ -37,7 +38,7 @@ torch.set_float32_matmul_precision("medium")
 HF_CACHE = "/root/autodl-tmp/hf_cache"
 os.environ["HF_HOME"] = HF_CACHE
 
-class SFTDataset(torch.utils.data.Dataset):
+class GRPODataset(torch.utils.data.Dataset):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
         super().__init__(**kwargs)
 
@@ -46,9 +47,9 @@ class SFTDataset(torch.utils.data.Dataset):
         self.train_config = train_config
 
         data_files = glob.glob(self.train_config.data_path + "/**/*.parquet", recursive=True)
-        print(f"sft data size: {sum([os.path.getsize(_) / (1024 * 1024) for _ in data_files]):.4f} MB\n")
+        print(f"grpo data size: {sum([os.path.getsize(_) / (1024 * 1024) for _ in data_files]):.4f} MB\n")
 
-        datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["conversations"], cache_dir=HF_CACHE, num_proc=32)
+        datas: Dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=False, trust_remote_code=True, columns=["label", "conversations"], cache_dir=HF_CACHE, num_proc=32)
         datas = datas.shuffle(seed=self.train_config.seed)
 
         # pre-chunk
@@ -58,70 +59,42 @@ class SFTDataset(torch.utils.data.Dataset):
             batch_size=5000,
             num_proc=32,
             remove_columns=datas.column_names,
-            cache_file_name=os.path.join(HF_CACHE, "parquet/sft/sft_map.cache")
+            cache_file_name=os.path.join(HF_CACHE, "parquet/grpo/grpo_map.cache")
         )
     
     def _preprocess(self, raw):
-        tokenized_text = []
-        for conversation in raw["conversations"]:
+        prompt = []
+        answer = []
+        for label, conversation in zip(raw["label"], raw["conversations"]):
             if (conversation[0]["from"] == "user" and conversation[1]["from"] == "gpt_reasoning" and conversation[2]["from"] == "gpt_output"):
-                content = f"<s><user>{conversation[0]["value"]}</s>\n<s><bot><think>{conversation[1]["value"]}</think>{conversation[2]["value"]}</s>\n"
-                content = self.tokenizer(content, add_special_tokens=False)['input_ids']
-                if len(content) > self.train_config.max_token_per_batch: continue
-                tokenized_text.append([content])
-        
-        # packing to max_seqlen
-        results = []
-        cache = []
-        batch_length = 0
-        for conversation in tokenized_text:
-            # filter out too long conversations or cot
-            if batch_length + len(conversation) <= self.train_config.max_token_per_batch:
-                cache.append(conversation)
-                batch_length += len(conversation)
-            elif len(cache) > 0:
-                results.append(cache)
-                cache = []
-                batch_length = 0
-        
-        if len(cache) > 0:
-            results.append(cache)
-            cache = []
-            batch_length = 0
+                content = f"<s><user>{conversation[0]["value"]}</s>"
+                prompt.append(content)
 
-        return {"input_ids": results}
+                # generate answer pattern
+                cache = []
+                for name, solution in zip(label["names"], label["solution"]):
+                    character = "knight" if solution else "knave"
+                    cache.append(rf"[\s]*\([\d]\)[\s]?{name} is a [kK]{character[1:]}")
+                answer.append(tuple(cache))
+
+        return dict(
+            input_dis=prompt,
+            labels=answer
+        )
     
     def process(self, indices: list[int]):
-        data = self.datas.select(indices)["input_ids"]
-        data = list(chain(*data))
+        raw_data = self.datas.select(indices)
+        input_ids, labels = raw_data["input_ids"], raw_data["labels"]
 
-        # generate varlen inputs
-        input_ids, labels = data, deepcopy(data)
-        cu_seqlens, max_seqlen = [0], 0
-        for i in range(len(input_ids)):
-            # replace labels with <pad> except for the bot reply
-            is_bot_reply = False
-            for j in range(len(labels[i])):
-                if labels[i][j] == self.model_config.bot_token_id: is_bot_reply = True
-                elif labels[i][j] == self.model_config.eos_token_id:
-                    if not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
-                    is_bot_reply = False
-                elif not is_bot_reply: labels[i][j] = self.model_config.pad_token_id
-
-            input_ids[i] = input_ids[i][:-1]
-            labels[i] = labels[i][1:]
-            max_seqlen = max(max_seqlen, len(input_ids[i]))
-            cu_seqlens.append(cu_seqlens[-1] + len(input_ids[i]))
+        outputs = self.tokenizer(input_ids, return_tensors="pt", padding="longest", padding_side="right")
         
-        input_ids = torch.tensor(list(chain(*input_ids)), dtype=torch.int64)
-        labels = torch.tensor(list(chain(*labels)), dtype=torch.int64)
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        input_ids = torch.tensor(outputs.input_ids, dtype=torch.int64)
+        attention_mask = torch.tensor(outputs.attention_mask, dtype=torch.int64)
 
         return dict(
             input_ids=input_ids,
             labels=labels,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen
+            attention_mask=attention_mask
         )
 
     def __getitem__(self, idx: int):
@@ -130,14 +103,14 @@ class SFTDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.datas)
 
-class SFTDataModule(LightningDataModule):
+class GRPODataModule(LightningDataModule):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
         super().__init__(**kwargs)
 
         self.model_config = model_config
         self.train_config = train_config
 
-        self.data = SFTDataset(tokenizer, model_config, train_config, **kwargs)
+        self.data = GRPODataset(tokenizer, model_config, train_config, **kwargs)
     
     def setup(self, stage):
         pass
@@ -156,19 +129,37 @@ class SFTDataModule(LightningDataModule):
 #########################################################
 #                  --- model ---
 #########################################################
-class SFTModule(LightningModule):
-    def __init__(self, tokenizer: AutoTokenizer, model: PreTrainedModel, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
+class GRPOModule(LightningModule):
+    def __init__(self, tokenizer: AutoTokenizer, model: PreTrainedModel, ref_model: PreTrainedModel, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
         super().__init__(**kwargs)
 
         self.tokenizer = tokenizer
         self.model = model
+        self.ref_model = ref_model
         self.model_config = model_config
         self.train_config = train_config
 
         self._date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self._train_tokens = 0
 
+        self.ref_model.eval()
+        self.ref_model.requires_grad_(False)
+
         self.save_hyperparameters(train_config)
+
+        self.generation_config = GenerationConfig(
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            max_new_tokens=4096,
+            do_sample=True,
+            top_k=20,
+            top_p=0.7,
+            temperature=0.8,
+            num_beams=1,
+            repeat_penalty=1.1,
+            use_cache=True
+        )
     
     @rank_zero_only
     def on_fit_start(self):
@@ -243,7 +234,46 @@ class SFTModule(LightningModule):
         else:
             self.clip_gradients(optimizer, gradient_clip_val, gradient_clip_algorithm)
     
+    def _compute_reward_for_each_rollout(self, rollout: str, answer: List[str]) -> float:
+        # 1st: compute format reward
+        format_reward = 0.
+        if rollout.count("<think>") == 1: format_reward += 1/3
+        if rollout.count("</think>") == 1: format_reward += 1/3
+        if rollout.count("</s>") == 1: format_reward += 1/3
+
+        # 2nd: compute answer reward
+        answer_reward = True
+        for _answer in answer:
+            if len(re.findall(_answer, rollout)) != 1: answer_reward = False
+        
+        if answer_reward: answer_reward = 1.
+        return self.train_config.answer_scale * answer_reward + self.train_config.format_scale * format_reward
+
+    def _compute_reward(self, rollout: List[str], answer: List[List[str]]):
+        rollout_reward = []
+        for i in range(0, len(rollout), self.train_config.rollout):
+            grouped_rollout = rollout[i:i+self.train_config.rollout]
+            grouped_answer = answer[i]
+
+            for _rollout in grouped_rollout:
+                _rollout_reward = self._compute_reward_for_each_rollout(_rollout, grouped_answer)
+
+
     def forward(self, data: Dict):
+        # Step 1: generate response for each request
+        self.model.eval()
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                rollout = self.model.generate(
+                    input_ids=data["input_ids"].repeat_interleave(self.train_config.rollout_num, dim=0),
+                    attention_mask=data["attention_mask"].repeat_interleave(self.train_config.rollout_num, dim=0),
+                    use_cache=True,
+                    use_varlen_inference=True,
+                    generation_config=self.generation_config
+                )
+                rollout = self.tokenizer.batch_decode(rollout, skip_special_tokens=False)
+
+
         outputs: CausalLMOutputWithPast = self.model(
             input_ids=data["input_ids"],
             labels=data["labels"],
@@ -302,7 +332,7 @@ def main(train_config: argparse.Namespace):
         gradient_clip_val=1.0,
         logger=WandbLogger(
             project="Sophie0",
-            name="reasoning_sft",
+            name="reasoning_grpo",
             save_dir=logger_path
         ),
         callbacks=ModelCheckpoint(
@@ -322,38 +352,47 @@ def main(train_config: argparse.Namespace):
         train_config.max_token_per_batch = train_config.max_token_per_batch // trainer.accumulate_grad_batches
 
     model = Sophie0ForCausalLM(model_config)
+    ref_model = Sophie0ForCausalLM(model_config)
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(os.path.join(_dir, "model", "tokenizer"), use_fast=True, trust_remote_code=True, local_files_only=True)
     datamodule = SFTDataModule(tokenizer, model_config, train_config)
 
     if train_config.max_steps == -1: train_config.max_steps = ((len(datamodule.data) + raw_batch_size - 1) // raw_batch_size) * train_config.max_epochs
 
-    if train_config.pretrained_ckpt_path != "": model.load_state_dict(torch.load(train_config.pretrained_ckpt_path, map_location='cpu', weights_only=True))
-    plmodel = SFTModule(tokenizer, model, model_config, train_config)
+    if train_config.pretrained_ckpt_path != "": 
+        _state_dict = torch.load(train_config.pretrained_ckpt_path, map_location='cpu', weights_only=True)
+        model.load_state_dict(_state_dict)
+        ref_model.load_state_dict(_state_dict)
+
+    plmodel = GRPOModule(tokenizer, model, model_config, train_config)
     trainer.fit(plmodel, datamodule=datamodule)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # dataset Args:
-    sft_parser = parser.add_argument_group("sft")
-    sft_parser.add_argument("--seed", type=int, default=17)
-    sft_parser.add_argument("--data_path", type=str, help="Path to the dataset dir", default="data/reasoning")
-    sft_parser.add_argument("--ckpt_path", type=str, help="Path to the checkpoint", default="result/sft_reasoning")
-    sft_parser.add_argument("--pretrained_ckpt_path", type=str, default="", help="Path to the pretrained checkpoint")
+    grpo_parser = parser.add_argument_group("grpo")
+    grpo_parser.add_argument("--seed", type=int, default=17)
+    grpo_parser.add_argument("--data_path", type=str, help="Path to the dataset dir", default="data/reasoning")
+    grpo_parser.add_argument("--ckpt_path", type=str, help="Path to the checkpoint", default="result/grpo_reasoning")
+    grpo_parser.add_argument("--pretrained_ckpt_path", type=str, default="", help="Path to the pretrained checkpoint")
 
-    sft_parser.add_argument("--max_seqlen", type=int, default=2048)
-    sft_parser.add_argument("--max_token_per_batch", type=int, default=524288)
-    sft_parser.add_argument("--batch_size", type=int, default=1)
-    sft_parser.add_argument("--accumulate_grad_batches", type=int, default=1, help="Accumulate gradients for every n batches")
-    sft_parser.add_argument("--num_workers", type=int, default=4)
+    grpo_parser.add_argument("--max_seqlen", type=int, default=2048)
+    grpo_parser.add_argument("--max_token_per_batch", type=int, default=524288)
+    grpo_parser.add_argument("--batch_size", type=int, default=1)
+    grpo_parser.add_argument("--accumulate_grad_batches", type=int, default=1, help="Accumulate gradients for every n batches")
+    grpo_parser.add_argument("--num_workers", type=int, default=4)
 
-    sft_parser.add_argument("--max_steps", type=int, default=-1)
-    sft_parser.add_argument("--max_epochs", type=int, default=1)
-    sft_parser.add_argument("--save_steps", type=int, default=-1)
-    sft_parser.add_argument("--max_lr", type=float, default=1e-4, help="Maximum learning rate")
-    sft_parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
-    sft_parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of steps to warm up learning rate")
-    sft_parser.add_argument("--precision", type=str, default="bf16-mixed")
+    grpo_parser.add_argument("--max_steps", type=int, default=-1)
+    grpo_parser.add_argument("--max_epochs", type=int, default=1)
+    grpo_parser.add_argument("--save_steps", type=int, default=-1)
+    grpo_parser.add_argument("--max_lr", type=float, default=1e-4, help="Maximum learning rate")
+    grpo_parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
+    grpo_parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of steps to warm up learning rate")
+    grpo_parser.add_argument("--precision", type=str, default="bf16-mixed")
+
+    grpo_parser.add_argument("--rollout", type=int, default=10)
+    grpo_parser.add_argument("--format_scale", type=float, default=0.1)
+    grpo_parser.add_argument("--answer_scale", type=float, default=1.0)
 
     args = parser.parse_args()
 
