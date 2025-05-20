@@ -3,14 +3,7 @@
 <h2>单人0.5B Toy LLM项目</h2>
 </div>
 
-<div align="center">
-<h3>目录</h3>
-</div>
-
-- [简介](#简介)
-- [参考资料](#参考资料)
-- [训练流程](#训练流程)
-- [推理优化](#推理优化)
+---
 
 <div align="center">
 <h3>简介</h3>
@@ -20,7 +13,24 @@ Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在
 
 此外，本项目进一步探讨了在下游SFT和DPO阶段完全使用变长(varlen)序列训练的可行性以及实现方式，充分利用了flash attention 2自带的`varlen attention` 和 `varlen RoPE`算子，同时也探讨了批量推理时引入的填充token对输出的影响，以及如何通过设计兼容varlen的KV Cache类直接基于Huggingface GenerationMixin接口无缝切块填充推理和无填充变长序列推理
 
+<div align="center">
+
+[![Model](https://img.shields.io/badge/Sophie0-0.5M-blue)]()
+[![Format](https://img.shields.io/badge/Transformers-Format-yellow)]()
+[![Inference](https://img.shields.io/badge/Varlen-Inference-purple)]()
+
+</div>
+
 ---
+
+<div align="center">
+<h3>目录</h3>
+</div>
+
+- [简介](#简介)
+- [参考资料](#参考资料)
+- [训练流程](#训练流程)
+- [推理优化](#推理优化)
 
 <div align="center">
 <h3>参考资料</h3>
