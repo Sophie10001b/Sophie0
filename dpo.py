@@ -363,6 +363,7 @@ def main(train_config: argparse.Namespace):
 
     model_config = Sophie0Config()
 
+    assert (train_config.max_epoches == -1 and train_config.max_steps != -1) or (train_config.max_epoches != -1 and train_config.max_steps == -1)
     trainer = Trainer(
         precision=train_config.precision,
         strategy="fsdp" if torch.cuda.device_count() > 1 else "auto",

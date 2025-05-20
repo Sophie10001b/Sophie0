@@ -31,7 +31,7 @@ Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在
 - https://github.com/zhanshijinwat/Steel-LLM
 - https://github.com/qiufengqijun/mini_qwen
 
-以及其它来源于知乎的未列出但十分有价值的关于SFT，PPO，DPO，GRPO，Reasoning等阶段的分析与复现文章
+以及其它来源于知乎但未在此统一列出的关于SFT，PPO，DPO，GRPO，Reasoning等阶段的分析与复现文章
 
 ---
 
@@ -353,6 +353,90 @@ When you run this program, it will output: `200
 ### GRPO + Reasoning
 *Comming soon, 由于模型规模较小，预计使用一半的reasoning数据集先进行SFT以对齐格式*
 
+**Datasets**&emsp; 参考[这篇复现工作](https://zhuanlan.zhihu.com/p/27699656438)，使用[Knights & Knaves](https://huggingface.co/datasets/K-and-K/knights-and-knaves)数据集作为主要训练和评估目标，由于模型规模受限，仅选择其中3ppl，也就是涉及3个角色的数据进行测试，总计包含有1000条训练数据，100条测试数据，每条训练集通过DeepSeek-R1采样3条思维链，最后选取1500条进行SFT以固定format，余下约500条问题则使用GRPO探索模型的reasoning能力。
+
+首先，为了第一步的SFT对齐，我利用OpenAI API以及火山引擎提供的DeepSeek-R1 API为每个训练样本生成3个完整的思维链与回答，将DeepSeek-R1的思维链作为Sophie0在SFT阶段学习与对齐的目标。具体来说，我使用32 Core CPU来并行地请求API生成思维链，最终整体耗时约1.2h，消耗Token 3.8M。喂给API的system prompt如下：
+```
+SYSTEM PROMPT:
+The user will provide some quiz about knights-and-knaves. Please point out who is the knight and who is the knave briefly and clearly and output them in a specific format. Please remind that DO NOT return any further explanation, and just return the formated answer.
+
+    EXAMPLE INPUT: 
+    A very special island is inhabited only by knights and knaves. Knights always tell the truth, and knaves always lie. You meet 2 inhabitants: Oliver, and Ethan. Oliver told you that Oliver is a knight or Ethan is a knave. In a statement by Ethan: "Oliver is a knight". So who is a knight and who is a knave?
+
+    EXAMPLE OUTPUT:
+    (1) Oliver is a knight
+    (2) Ethan is a knight
+```
+
+之后则需要对生成的思维链以及答案的有效性进行检查和过滤，具体来说需要检查以下两个方面：
+1. 思维链生成是否完整
+2. 生成的答案是否正确
+
+为了简便起见，第一步直接检查思维链是否以`.`, `\n`, `.\n`结束，第二步则使用以下的正则表达式检查结果是否匹配：
+```
+[\s]*\([\d]\)[\s]?{name} is a [kK]{character[1:]}
+```
+其中`{name}`为角色名字，`character`则对应了`knight`或者`knave`，首字母无视大小写。如果答案中三位角色均推理正确，则将此条思维链作为SFT训练集，否则将其丢弃。经过检查后，模型生成的所有思维链均正常结束，其中有35/3000条推理对应的答案错误。最终，我们得到了1482条思维链用于SFT对齐，余下的1483条对应的问题则作为GRPO的训练目标。
+
+**SFT Alignment**&emsp; 在思维链SFT与GRPO阶段，Sophie0均使用未经过DPO对齐的SFT模型进行对应的后训练。其中，由于SFT对齐的训练数据很少，因此Sophie0仅使用单张vGPU-32GB，以16 batch size训练3个epoch，学习率上界设置为标准SFT阶段的1/10，也就是5e-6来尽量减少过拟合。对齐期间的loss如下图所示：
+![fig](fig/reasoning_sft_loss.png)
+
+可以看到经过近300steps的对齐后，模型基本上已经完成了收敛。为了验证在如此小规模的数据集进行单独SFT后，模型是否还保持有基本的对话能力，我额外对这一阶段的模型进行了对话测试：
+```
+0: <s><user>能否解释一下Transformer架构呢？</s>
+<s><bot>Transformer（Generative Transformer）是一种用于生成、训练和生成自然语言处理的机器学习模型。它通过在大量数据上进行训练，并在生成过程中生成符合条件的输出。
+Transformer架构是指一种用于生成、训练和生成自然语言处理模型的工具。它通过构建一个神经网络模型，使得模型能够生成人类可读的文本、图像、语音和文本内容。
+下面是一些常见的Transformer架构的例子：
+1. 预训练模型：通常使用预训练模型来生成自然语言文本。这可能需要大量的数据和计算资源，但是通常需要大量的数据和计算资源。
+2. 模型训练：使用预训练模型来生成自然语言文本。这可能需要大量的数据和计算资源，但对于大规模的数据和计算资源来说可能需要大量的计算资源。
+3. 模型评估：使用训练数据来评估模型的性能。这可能需要大量的数据和计算资源，但是对于大规模的数据和计算资源来说可能需要大量的计算资源。
+4. 模型评估：使用训练好的模型来评估模型的性能。这可能需要大量的计算资源，但对于大规模的数据和计算资源来说可能需要大量的计算资源。
+5. 模型部署：使用训练好的模型来训练模型。这可能需要大量的计算资源，但对于大规模的数据和计算资源来说可能需要大量的计算资源。
+6. 模型部署：使用训练好的模型来训练模型。这可能需要大量的计算资源，但对于大规模的数据和计算资源来说可能需要大量的计算资源。
+总之，Transformer架构是一种基于Transformer架构的机器学习模型，它能够自动地生成自然语言文本、语音和文本内容。</s><pad>...
+```
+可见，除去由于规模较小导致的输出重复问题，模型的输出与原始的SFT模型基本仍能保持相似，这说明在思维链上的微调并没有明显破坏原本的对话能力。
+
+而对于作为目标的reasoning能力，可直接使用kk-3ppl的100条测试集进行3-shot验证。其中输入仅为题干，最长response限制为4096，得到的总体结果如下：
+| Format Match | Reasoning Completed | Answer Correct |
+| --- | --- | --- |
+| 202 / 300 | 202 / 300 | 10 / 100 |
+
+其中`Format Match`要求模型完整输出`<think>`以及`</think>`；`Reasoning Completed`要求模型在4096长度下返回完整的reasoning和答案；`Answer Correct`则要求模型对3个人物的推理结果均能够匹配相应的答案。可以发现，经过SFT对齐后模型确实能够遵循reasoning的推理格式，所有输出的格式匹配率达到了67.33%，而结果正确率为10%，这些数据可以作为GRPO的baseline
+
+对于具体的推理输出，我选取了test set中的1个问题作为case，其推理结果如下：
+```
+0: <s><user>A very special island is inhabited only by knights and knaves. Knights always tell the truth, and knaves always lie. You meet 3 inhabitants: Olivia, Amelia, and James. "James is a knave" - Olivia. Amelia expressed that Olivia is a knave. James stated, "James is a knight if and only if Amelia is a knight". So who is a knight and who is a knave?</s>
+<s><bot><think>Okay, let's try to figure out this knights and knaves puzzle. So we have three people: Olivia, Amelia, and James. Each of them made a statement. Let's break down each statement and see what we can deduce.
+
+First, Olivia says that Olivia is a knave. So if Olivia is a knight, then her statement is true, which means Olivia is a knave. But if Olivia is a knave, then her statement is false, so Olivia would be a knight. But if Olivia is a knave, then her statement is false, so Olivia is a knave. That's a contradiction. So Olivia can't be a knight. Therefore, Olivia must be a knave. Because if she's a knave, her statement is false, so Olivia must be a knight.
+
+Next, Amelia says that James is a knight if and only if Amelia is a knight. Let's parse that. If Amelia is a knight, then James is a knight. If Amelia is a knight, then James is a knave. So James is a knave. Then James's statement is false, so James is a knave.
+
+Then James's statement: "James is a knight if and only if Amelia is a knight." Let's parse that. The biconditional (iff) means both parts have to be the same. So if James is a knight (truth-teller), then the right side (Amelia is a knight) must be true. But since Amelia is a knight, the left side (James is a knight) is false, so the right side (Amelia is a knight) must be true. Wait, but Amelia is a knave here, so the left side (James is a knight) is false. Therefore, the right side (Amelia is a knight) is false, so the right side (Amelia is a knave) must be true. Wait, but Amelia is a knave, so her statement is false. The biconditional here would be false only if Amelia is a knight (which she is) and Amelia is a knave (which she is). So the biconditional would be false only if Amelia is a knight (which she is), but Amelia is a knave, so the biconditional would be false. Wait, but Amelia is a knave here, so her statement is false. The biconditional here is that if she's a knight, then Amelia is a knave. But Amelia is a knave, so the biconditional would be false. But since Amelia is a knave, her statement is false. Therefore, Amelia must be a knight. Because if she's a knight, her statement is false, so Amelia is a knave. But Amelia is a knave, so her statement is false. The biconditional is false when the two sides are different. So Amelia is a knight (which she is) and Amelia is a knave (which she is). But since Amelia is a knave, the left side (James is a knight) is false, so the right side (Amelia is a knave) must be true. But Amelia is a knave, so her statement is false. Therefore, Amelia must be a knight. So Amelia is a knave. But wait, let's check Amelia's statement again. Amelia is a knave, so her statement is false. The biconditional is false when the two sides differ. So Amelia is a knave (true) and Amelia is a knight (false). But Amelia is a knave, so her statement is false. The biconditional is false when the two sides differ. So Amelia is a knave. But Amelia is a knave, so her statement is false. The biconditional is false when the two sides differ. So Amelia is a knave (true) and Amelia is a knight (false). But Amelia is a knave, so her statement is false. The biconditional is false when the two sides differ. So Amelia is a knave. But Amelia is a knave, so her statement is false. The biconditional is false when the two sides differ. So the biconditional is false when the two sides differ. So Amelia is a knave, which means she lies. That's okay. So the conclusion is Olivia is a knave, Amelia is a knight, James is a knight. Wait, but wait. Wait, the problem states that knights and knaves have to be the same. So the answer should be Olivia is a knave, Amelia is a knight, James is a knight. But wait, let me check again. If Olivia is a knave, then her statement is false. The biconditional is false when the two sides differ. So the biconditional is false when the two sides differ. So Amelia is a knave, Amelia is a knight, James is a knight. So the biconditional is false. That's correct. So the answer is Olivia is a knave, Amelia is a knight, James is a knight.
+</think>(1) Olivia is a knave
+(2) Amelia is a knight
+(3) James is a knight</s>
+```
+可以看到，经过SFT后的模型确实能够按照规定的reasoning格式进行输出，并且整个reasoning格式也似乎合理，不过值得注意的是最后一长段推理中模型输出了非常多重复句式，比如一直在重复`Amelia is a knave, so the biconditional would be false...`相似的句式，但在reasoning最后还是答对了问题。考虑到Knight & Knave数据集中的问题格式本来就比较重复，此时暂时无法排除SFT后模型单纯照葫芦画瓢的情况。而对于其它格式的正常对话，若在起始符后添加\<think\>，则对应的输出如下：
+```
+1: <s><user>Could you please give a C++ example for quick sort?</s>
+<s><bot><think>(/) (C++))
+
+This code is a C++ program that uses the Sieve of Eratosthenes algorithm to sort a list of numbers. The algorithm works by repeatedly dividing the list into two halves, comparing each one with the previous one. Here's a step-by-step explanation of how it works:
+
+1. The function `sortBy` takes two parameters: `arr`, which is the list of numbers to be sorted.
+2. The function `sortBy` takes two parameters: the list to be sorted, and the second parameter, which is the second element of the sorted list.
+3. Inside the function, a variable "n" is initialized to 0. This variable will store the current index of the array.
+4. The function then uses a loop to iterate through the list and compare each element with the previous one.
+5. If the loop completes without finding a match, the function returns the index of the current element.
+6. If the loop completes without finding a match, the function returns the index of the current element.
+
+You can use this code by calling the `sortBy` function and passing the list of numbers as an argument. For example, `sortBy([5, 3, 2, 4, 5, 6])` will return the sorted list [1, 2, 3, 4, 5, 6]. For example, if you call `sortBy([1, 2, 3, 4, 5, 6]`, the output would be [1, 2, 3, 4, 5, 6]. If you call `sortBy([1, 2, 3, 4, 5, 6])`, the output would be [1, 2, 3, 4, 5]. So the output would be [1, 2, 3, 4, 5, 6]. For example, if you call `sortBy([1, 2, 3, 4, 5, 6])`, the output would be [1, 2, 3, 4, 5, 6]. So the output would be [1, 2, 3, 4, 5, 6]. If you need to use the `sortBy` function, you can directly pass it as an argument to the `sortBy` function. For example, if you have
+```
+
+比较遗憾的是，标准的reasoning模板并没有延续到通常的对话格式上，并且此时模型出现了明显的幻觉问题，可以看出单纯仅通过少样本的Knight & Knave数据集无法让模型学会通用的reasoning能力。
+
 ---
 
 <div align="center">
@@ -521,10 +605,14 @@ By using this code, you can easily sort any given array in ascending order.</s>
 - `Attention`: 在注意力层，Sophie0使用与训练时一致的varlen attention算子，不过需要注意query和KV对应着不同的序列索引
 - `Output`: 在得到模型的当前步输出后，需要通过`cu_seqlens`提取出每个序列最后的token，作为当前步生成的新token
 
-其核心的KV Cache 更新步骤如下图所示，通过`split` -> `chain` -> `concat`这三步将新的KV填充至cache中：
-![fig](fig/varlen_cache.png)
+对于核心的KV Cache，Sophie0直接对每一个request单独维护一个KV Cache，所有request的Cache以`Tuple[Tensor]`的形式维护，每一步的新KV Cache会先通过每个request的生成长度对Cache进行split后直接concat进入对应的Cache，随后通过单独的concat函数生成flash_attn能够处理的KV Cache形式。为了验证Varlen Cache中的额外操作对整体吞吐量和显存占用的影响，我使用经过Reasoning SFT阶段的checkpoint对kk_3ppl的100条测试集进行单batch 10-shot推理，两种策略对应的吞吐量和显存峰值占用如下：
+| | Vanilla Inference | Varlen Inference |
+| --- | --- | --- |
+| Mem. Usage | 6.75GB | 4.89GB |
+| Speed | 178.92s/it | 224.11s/it |
+| Max GPU Utilization | 55% | 46% |
 
-通过以上步骤，Sophie0即可使用varlen attention算子以padding-free形式处理不定长数据的batch inference
+可以发现，Varlen形式的管理导致了大约25%左右的吞吐量下降，但相对的节省了27.5%的峰值显存占用，这个优势在多batch变长推理的情况下会进一步扩大。同时，由于Sophie0在除去pretrain以外的阶段均使用了varlen形式完成训练，因此padding-free形式的推理策略对于Sophie0来说也是十分必要的
 
 ---
 

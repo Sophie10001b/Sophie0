@@ -168,10 +168,10 @@ class Cache(transformers.cache_utils.Cache):
 
 class VarlenCache(transformers.cache_utils.Cache):
     """
-    A cache used for storing hidden states produced by varlen batch inference.
+    A varlen cache used for storing hidden states produced by varlen batch inference.
 
     **Input:**
-        - attn_state: Cache for standard attention, tuple(size(bsz * k_len/v_len, dmodel) * 2)
+        - attn_state: Cache for standard attention, tuple(size(total_nnz, dmodel) * 2)
     """
 
     is_compileable = True
@@ -183,7 +183,7 @@ class VarlenCache(transformers.cache_utils.Cache):
         self._cache_position = [torch.full((batch_size,), cache_position, dtype=torch.int64, device=device)] # Used in `generate` to keep tally of how many tokens the cache has seen
         self.batch_size =  batch_size
         self.device = device
-
+    
     def __getitem__(self, layer_idx: int) -> Dict[str, Any]:
         if layer_idx < len(self):
             return self.states[layer_idx]
@@ -195,7 +195,7 @@ class VarlenCache(transformers.cache_utils.Cache):
 
     def __len__(self):
         return len(self.states)
-
+    
     def update(
         self,
         attn_state: Tuple[torch.Tensor, torch.Tensor] = None,
@@ -208,7 +208,7 @@ class VarlenCache(transformers.cache_utils.Cache):
 
         Args:
             attn_state (`Tuple[torch.Tensor, torch.Tensor]`, `optional`):
-                The new attention key/value states to cache, sizes (bsz * seqlen, hidden_size)
+                The new attention key/value states to cache, sizes (total_nnz, hidden_size)
             cu_seqlens (`torch.LongTensor`):
                 the accumulated sequence length for current states, sizes (bsz + 1,)
             layer_idx (`int`, defaults to 0):
@@ -220,53 +220,55 @@ class VarlenCache(transformers.cache_utils.Cache):
             Dictionary of the updated state.
         """
 
-        # Update the number of seen tokens
+        if attn_state is not None:
+            if not isinstance(attn_state, Tuple) or len(attn_state) != 2:
+                raise ValueError("`attn_state` must be a tuple of two tensors for key/value states")
+        
+        dtype = attn_state[0].dtype
+        device = attn_state[0].device
+        hidden_size = attn_state[0].size(-1)
+
+        # Case 1: prefill at the 1st step
         if len(self._cache_position) <= layer_idx:
             self._cache_position.append(
                 torch.zeros((cu_seqlens.size(0) - 1,), dtype=torch.int64, device=cu_seqlens.device)
             )
 
         kv_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        kv_seqlens_cpu = kv_seqlens.cpu().tolist()
         self._cache_position[layer_idx] += kv_seqlens
 
-        if attn_state is not None:
-            if not isinstance(attn_state, Tuple) or len(attn_state) != 2:
-                raise ValueError("`attn_state` must be a tuple of two tensors for key/value states")
-            
         if len(self.states) <= layer_idx:
+            key_state, value_state = list(map(lambda x: torch.split(x, kv_seqlens_cpu), attn_state))
             state = dict(
-                attn_state=attn_state,
+                attn_state=(key_state, value_state),
                 cu_seqlens=cu_seqlens,
                 max_seqlen=kv_seqlens.max().item()
             )
             self.states.append(state)
+
+        # Case 2: append current step's kv cache
         else:
-            # append current steps states (bsz * 1, hidden_size) into kv_cache (bsz * seqlen, hidden_size)
             state = self.states[layer_idx]
-            if attn_state is not None:
-                if state['attn_state'] is not None:
-                    key_state, value_state = attn_state # new kv
-                    key_cache, value_cache = state['attn_state'] # old kv
-                    kv_cu_seqlens = state['cu_seqlens']
-                    old_kv_seqlens = kv_cu_seqlens[1:] - kv_cu_seqlens[:-1]
+            if state["attn_state"] is not None:
+                key_state, value_state = list(map(lambda x: torch.split(x, kv_seqlens_cpu), attn_state))
+                key_cache, value_cache = state['attn_state']
+                old_cu_seqlens = state['cu_seqlens']
 
-                    # split -> chain -> concat
-                    key_cache, value_cache = list(map(lambda x: torch.split(x, old_kv_seqlens.tolist()), [key_cache, value_cache]))
-                    key_state, value_state = list(map(lambda x: torch.split(x, kv_seqlens.tolist()), [key_state, value_state]))
-
-                    key_cache = list(chain(*[[_raw, _new] for _raw, _new in zip(key_cache, key_state)]))
-                    value_cache = list(chain(*[[_raw, _new] for _raw, _new in zip(value_cache, value_state)]))
-                    key_cache, value_cache = list(map(lambda x: torch.cat(x), [key_cache, value_cache]))
-                    new_cu_seqlens = cu_seqlens + kv_cu_seqlens
-
-                    attn_state = (key_cache, value_cache)
-
-                state['attn_state'] = attn_state
-                state['cu_seqlens'] = new_cu_seqlens
-                state['max_seqlen'] = (new_cu_seqlens[1:] - new_cu_seqlens[:-1]).max().item()
-
+                key_cache = tuple(map(lambda x, y: torch.cat([x, y], dim=0), key_cache, key_state))
+                value_cache = tuple(map(lambda x, y: torch.cat([x, y], dim=0), value_cache, value_state))
+                
+                new_cu_seqlens = old_cu_seqlens + cu_seqlens
+                state.update(
+                    attn_state=(key_cache, value_cache),
+                    cu_seqlens=new_cu_seqlens,
+                    max_seqlen=(new_cu_seqlens[1:] - new_cu_seqlens[:-1]).max().item()
+                )
         return state
-
+    
+    def get_kv_cache(self, state: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        return tuple(map(lambda x: torch.cat(x, 0), state['attn_state']))
+    
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> torch.Tensor:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
         if len(self.states) <= layer_idx:
@@ -289,7 +291,7 @@ class VarlenCache(transformers.cache_utils.Cache):
     def reorder_cache(self, beam_idx: torch.LongTensor):
         """Reorders the cache for beam search, given the selected beam indices."""
         raise NotImplementedError("Varlen Batch Inference does not support beam search at now.")
-
+    
     @classmethod
     @torch.compiler.disable
     def from_legacy_cache(
@@ -442,7 +444,7 @@ class FullAttention(nn.Module):
                     layer_idx=self.layer_idx,
                     cache_kwargs=dict()
                 )
-                k, v = new_cache['attn_state']
+                k, v = past_key_values.get_kv_cache(new_cache)
                 k, v = rearrange(k, "... (H D) -> ... H D", H=self.num_kv_heads, D=self.head_size), rearrange(v, "... (H D) -> ... H D", H=self.num_kv_heads, D=self.head_size)
 
                 kv_cu_seqlens, kv_max_seqlen = new_cache['cu_seqlens'], new_cache['max_seqlen']
