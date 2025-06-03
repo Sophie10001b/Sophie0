@@ -453,7 +453,7 @@ You can use this code by calling the `sortBy` function and passing the list of n
 3. 计算每个prompt的所有rollout的相对得分:
 
 ```math
- \hat{A}_{i} = \frac{r_i - \operatorname{mean}_{i=0}^{t}(r_i)}{\operatorname{std}_{i=1}^{t}(r_i)}
+ \hat{A}_{i} = \frac{r_i - \text{mean}_{i=0}^{t}(r_i)}{\text{std}_{i=1}^{t}(r_i)}
 ```
 
 4. 将rollout处理为forward数据格式，让待训练模型$\pi_{\theta}$和冻结的参考模型$\pi_{ref}$分别生成对应rollout的probability，并得到对应的KL Loss:
@@ -465,7 +465,7 @@ You can use this code by calling the `sortBy` function and passing the list of n
 5. 基于KL Loss和每个rollout的相对得分，计算最终的整体loss:
 
 ```math
-\mathcal{L}_{GRPO} = \frac{1}{t}\sum_{i=1}^{t}\left\{\operatorname{min}\left[\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}\hat{A}_{i}, \operatorname{clip}\left(\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}, 1-\epsilon, 1+\epsilon\right)\hat{A}_{i}\right] - \beta\mathcal{L}_{KL}\right\}
+\mathcal{L}_{GRPO} = \frac{1}{t}\sum_{i=1}^{t}\left\{\text{min}\left[\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}\hat{A}_{i}, \text{clip}\left(\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}, 1-\epsilon, 1+\epsilon\right)\hat{A}_{i}\right] - \beta\mathcal{L}_{KL}\right\}
 ```
 
 值得注意的是，在对rollout平均之前，Sophie0会先使用`scatter_mean`在rollout长度上进行平均，从而完全对齐原始GRPO公式中的主要操作。
