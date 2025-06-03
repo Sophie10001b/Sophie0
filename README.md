@@ -451,17 +451,22 @@ You can use this code by calling the `sortBy` function and passing the list of n
 1. 使用待训练模型$\pi_{\theta}$为prompt $p$采样生成16条rollout $o_i$
 2. 对每个batch的rollout计算格式得分：包含`<think>`, `</think>`, `</s>`各得(1/3 * 0.1)分；随后通过正则表达式计算答案得分，若3个角色的身份全对，则得1分，否则不得分。格式分数与答案分数相加得到该rollout总分 $r_i$
 3. 计算每个prompt的所有rollout的相对得分:
-   ```math
-    \hat{A}_{i} = \frac{r_i - \operatorname{mean}_{i=0}^{t}(r_i)}{\operatorname{std}_{i=1}^{t}(r_i)}
-   ```
+
+```math
+ \hat{A}_{i} = \frac{r_i - \operatorname{mean}_{i=0}^{t}(r_i)}{\operatorname{std}_{i=1}^{t}(r_i)}
+```
+
 4. 将rollout处理为forward数据格式，让待训练模型$\pi_{\theta}$和冻结的参考模型$\pi_{ref}$分别生成对应rollout的probability，并得到对应的KL Loss:
-   ```math
-   \mathcal{L}_{KL} = \frac{\pi_{ref}(o_i|p)}{\pi_{\theta}(o_i|p)} - \log{\frac{\pi_{ref}(o_i|p)}{\pi_{\theta}(o_i|p)}} - 1
-   ```
+
+```math
+\mathcal{L}_{KL} = \frac{\pi_{ref}(o_i|p)}{\pi_{\theta}(o_i|p)} - \log{\frac{\pi_{ref}(o_i|p)}{\pi_{\theta}(o_i|p)}} - 1
+```
+
 5. 基于KL Loss和每个rollout的相对得分，计算最终的整体loss:
-   ```math
-   \mathcal{L}_{GRPO} = \frac{1}{t}\sum_{i=1}^{t}\left\{\operatorname{min}\left[\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}\hat{A}_{i}, \operatorname{clip}\left(\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}, 1-\epsilon, 1+\epsilon\right)\hat{A}_{i}\right] - \beta\mathcal{L}_{KL}\right\}
-   ```
+
+```math
+\mathcal{L}_{GRPO} = \frac{1}{t}\sum_{i=1}^{t}\left\{\operatorname{min}\left[\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}\hat{A}_{i}, \operatorname{clip}\left(\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}, 1-\epsilon, 1+\epsilon\right)\hat{A}_{i}\right] - \beta\mathcal{L}_{KL}\right\}
+```
 
 值得注意的是，在对rollout平均之前，Sophie0会先使用`scatter_mean`在rollout长度上进行平均，从而完全对齐原始GRPO公式中的主要操作。
 
@@ -508,7 +513,7 @@ You can use this code by calling the `sortBy` function and passing the list of n
 | 3 | 24% | 34% |
 | 16 | 68% | 56% |
 
-可以看出经过GRPO的模型在pass@1上提升了2倍，在pass@3上提升了约41%，但在pass@16上反而下降了约17%，这个结论与这篇论文中的观点[^yue2025RL]一致，即模型对复杂推理任务的解决能力上界在base model中已经定型，GRPO等现有RL算法主要让模型更倾向于优先输出"正确"答案，即提高pass@1通过率，但当答案采样变多时，RL对模型输出多样性和探索空间的限制反而让经过RL的模型在pass@k上低于base model
+可以看出经过GRPO的模型在pass@1上提升了2倍，在pass@3上提升了约41%，但在pass@16上反而下降了约17%，这个结论与这篇论文中的观点[^yue2025RL]一致，即模型对复杂推理任务的解决能力上界在base model中已经定型，GRPO等现有RL算法主要让模型更倾向于优先采样"正确"答案，即提高pass@1通过率，但当答案采样变多时，RL对模型输出多样性和探索空间的约束反而让经过RL的模型在pass@k上低于base model
 
 ---
 
