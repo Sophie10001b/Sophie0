@@ -9,7 +9,7 @@
 <h3>简介</h3>
 </div>
 
-Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在于完整跑通**预训练(Pretrain)**、**监督微调(Supervised Fine-tune, SFT)**、**直接偏好优化(Direct Preference Optimization, DPO)**、以及显示思维链推理等主要流程。其中预训练阶段使用BAAI开源的多领域数据集，总数据量约11B Tokens，消耗52x4 GPU hours；微调阶段使用BAAI以及数学CoT数据在内总计9.74M行对话数据，消耗24x8 GPU hours；DPO阶段使用BAAI的偏好数据以及从LLama 3提取的英语对话数据在内总计159.3k对数据，消耗1x4 GPU hours
+Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在于完整跑通**预训练(Pretrain)**、**监督微调(Supervised Fine-tune, SFT)**、**直接偏好优化(Direct Preference Optimization, DPO)**、以及基于**组内相对策略优化(Group Relative Policy Optimization)**的显示思维链推理等主要流程。其中预训练阶段使用BAAI开源的多领域数据集，总数据量约11B Tokens，消耗52x4 GPU hours；微调阶段使用BAAI以及数学CoT数据在内总计9.74M行对话数据，消耗24x8 GPU hours；DPO阶段使用BAAI的偏好数据以及从LLama 3提取的英语对话数据在内总计159.3k对数据，消耗1x4 GPU hours；GRPO阶段使用Knights & Knaves 3ppl数据集以及从DeepSeek-R1提取的思维链对模型进行SFT和GRPO，SFT阶段总计有1.5k条数据，GRPO阶段总计有500条prompt，前者消耗10min x 1 GPU Times，后者消耗51x2 GPU hours.
 
 此外，本项目进一步探讨了在下游SFT和DPO阶段完全使用变长(varlen)序列训练的可行性以及实现方式，充分利用了flash attention 2自带的`varlen attention` 和 `varlen RoPE`算子，同时也探讨了批量推理时引入的填充token对输出的影响，以及如何通过设计兼容varlen的KV Cache类直接基于Huggingface GenerationMixin接口无缝切块填充推理和无填充变长序列推理
 
@@ -31,6 +31,8 @@ Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在
 - [参考资料](#参考资料)
 - [训练流程](#训练流程)
 - [推理优化](#推理优化)
+
+---
 
 <div align="center">
 <h3>参考资料</h3>
@@ -361,8 +363,6 @@ When you run this program, it will output: `200
 整体上来看，相较于SFT后的模型，DPO对小模型的增益似乎并不明显，可能需要使用专门的偏好数据集进行验证
 
 ### GRPO + Reasoning
-*Comming soon, 由于模型规模较小，预计使用一半的reasoning数据集先进行SFT以对齐格式*
-
 **Datasets**&emsp; 参考[这篇复现工作](https://zhuanlan.zhihu.com/p/27699656438)，使用[Knights & Knaves](https://huggingface.co/datasets/K-and-K/knights-and-knaves)数据集作为主要训练和评估目标，由于模型规模受限，仅选择其中3ppl，也就是涉及3个角色的数据进行测试，总计包含有1000条训练数据，100条测试数据，每条训练集通过DeepSeek-R1采样3条思维链，最后选取1500条进行SFT以固定format，余下约500条问题则使用GRPO探索模型的reasoning能力。
 
 首先，为了第一步的SFT对齐，我利用OpenAI API以及火山引擎提供的DeepSeek-R1 API为每个训练样本生成3个完整的思维链与回答，将DeepSeek-R1的思维链作为Sophie0在SFT阶段学习与对齐的目标。具体来说，我使用32 Core CPU来并行地请求API生成思维链，最终整体耗时约1.2h，消耗Token 3.8M。喂给API的system prompt如下：
@@ -407,12 +407,12 @@ Transformer架构是指一种用于生成、训练和生成自然语言处理模
 ```
 可见，除去由于规模较小导致的输出重复问题，模型的输出与原始的SFT模型基本仍能保持相似，这说明在思维链上的微调并没有明显破坏原本的对话能力。
 
-而对于作为目标的reasoning能力，可直接使用kk-3ppl的100条测试集进行3-shot验证。其中输入仅为题干，最长response限制为4096，得到的总体结果如下：
+而对于作为目标的reasoning能力，可直接使用kk-3ppl的100条测试集进行3-shot验证。其中输入仅为题干，最长response限制为2048，得到的总体结果如下：
 | Format Match | Reasoning Completed | Answer Correct |
 | --- | --- | --- |
-| 202 / 300 | 202 / 300 | 10 / 100 |
+| 209 / 300 | 209 / 300 | 24 / 100 |
 
-其中`Format Match`要求模型完整输出`<think>`以及`</think>`；`Reasoning Completed`要求模型在4096长度下返回完整的reasoning和答案；`Answer Correct`则要求模型对3个人物的推理结果均能够匹配相应的答案。可以发现，经过SFT对齐后模型确实能够遵循reasoning的推理格式，所有输出的格式匹配率达到了67.33%，而结果正确率为10%，这些数据可以作为GRPO的baseline
+其中`Format Match`要求模型完整输出`<think>`以及`</think>`；`Reasoning Completed`要求模型在2048长度下返回完整的reasoning和答案；`Answer Correct`则要求模型对3个人物的推理结果均能够匹配相应的答案。可以发现，经过SFT对齐后模型确实能够遵循reasoning的推理格式，所有输出的格式匹配率达到了69.66%，而结果正确率为24%，这些数据可以作为GRPO的baseline
 
 对于具体的推理输出，我选取了test set中的1个问题作为case，其推理结果如下：
 ```
@@ -446,6 +446,69 @@ You can use this code by calling the `sortBy` function and passing the list of n
 ```
 
 比较遗憾的是，标准的reasoning模板并没有延续到通常的对话格式上，并且此时模型出现了明显的幻觉问题，可以看出单纯仅通过少样本的Knight & Knave数据集无法让模型学会通用的reasoning能力。
+
+**GRPO Alignment**&emsp; 在完成基础的SFT格式对齐后，便可以使用GRPO进一步提升模型的reasoning能力。具体来说，Sophie0的整体GRPO流程主要参考了Huggingface TRL框架里的实现方式，整体训练使用2张vGPU-32GB训练完成，总计51h，开销约171RMB。由于在基础实现下每张卡需要单独处理它负责batch的所有rollout结果，为了避免OOM，每张卡仅使用bathc size 1，rollout 16训练5 epochs，学习率上界设为5e-6，每epoch iteration与DeepSeek Math原文保持一致，也就是1，此时$\pi_{\theta} = \pi_{old}$，同时KL Loss的$\beta$使用TRL中默认的0.04。在bathch=1的情况下，Sophie0整体的GRPO流程如下：
+1. 使用待训练模型$\pi_{\theta}$为prompt $p$采样生成16条rollout $o_i$
+2. 对每个batch的rollout计算格式得分：包含`<think>`, `</think>`, `</s>`各得(1/3 * 0.1)分；随后通过正则表达式计算答案得分，若3个角色的身份全对，则得1分，否则不得分。格式分数与答案分数相加得到该rollout总分 $r_i$
+3. 计算每个prompt的所有rollout的相对得分:
+   ```math
+    \hat{A}_{i} = \frac{r_i - \operatorname{mean}_{i=0}^{t}(r_i)}{\operatorname{std}_{i=1}^{t}(r_i)}
+   ```
+4. 将rollout处理为forward数据格式，让待训练模型$\pi_{\theta}$和冻结的参考模型$\pi_{ref}$分别生成对应rollout的probability，并得到对应的KL Loss:
+   ```math
+   \mathcal{L}_{KL} = \frac{\pi_{ref}(o_i|p)}{\pi_{\theta}(o_i|p)} - \log{\frac{\pi_{ref}(o_i|p)}{\pi_{\theta}(o_i|p)}} - 1
+   ```
+5. 基于KL Loss和每个rollout的相对得分，计算最终的整体loss:
+   ```math
+   \mathcal{L}_{GRPO} = \frac{1}{t}\sum_{i=1}^{t}\left\{\operatorname{min}\left[\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}\hat{A}_{i}, \operatorname{clip}\left(\frac{\pi_{\theta}(o_i|p)}{\pi_{old}(o_i|p)}, 1-\epsilon, 1+\epsilon\right)\hat{A}_{i}\right] - \beta\mathcal{L}_{KL}\right\}
+   ```
+
+值得注意的是，在对rollout平均之前，Sophie0会先使用`scatter_mean`在rollout长度上进行平均，从而完全对齐原始GRPO公式中的主要操作。
+
+随后是训练过程中的主要指标变化：
+<table>
+<tr>
+<td><img src="fig/grpo_response_length.png" height=150/></td>
+<td><img src="fig/grpo_kl.png" height=150/></td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td><img src="fig/grpo_format_reward.png" height=150/></td>
+<td><img src="fig/grpo_answer_reward.png" height=150/></td>
+</tr>
+</table>
+
+可以发现模型的response length从>1k的长度快速缩短至500，随后逐步稳定在700 tokens左右，对应的KL loss则出现了先快速上上在下降至趋于平稳的过程。由于此时的ref model为经过DeepSeek-R1思维链SFT后的模型，因此思维链长度下降和KL Loss趋势是符合预期的，因为仅经过SFT的模型仅学习到了DeepSeek的长思维链形式，其内部存在有非常多的重复句段，导致整体思维链长度较长但对最终的推理正确率帮助不大。
+
+而在rewards变化上，format reward长期维持在0.66附近，这主要是由于部分rollout长度过长被截断，导致没有输出最终的结束符，但整体很好的保持了`<think></think>`格式；answer reward则整体呈现上升趋势，从大约0.05上升至0.2-0.25。虽然因为batch size较小导致整体波动较大，但相关的曲线表明模型整体是朝着正确的方向训练。
+
+接下来是训练不同阶段的rollout结果，以下是第0步的rollout:
+```
+"<think>Okay, let's tackle this knights and knaves problem. So we have three people: Riley, Samuel, and Liam. Each of them made a statement, and we need to figure out who's who.\n\nFirst, let's list out their statements:\n\n- Riley says: \"Liam is not a knave.\"\n- Samuel says: \"Riley is not a knave.\"\n- Liam says: \"Samuel is a knight if and only if Riley is a knight.\"\n\nHmm. Let's break this down step by step.\n\nStarting with Riley's statement: \"Liam is not a knave.\" If Riley is a knight, then his statement is true, so Liam must be a knave. If Riley is a knave, then his statement is false, meaning Liam is a knight.\n\nNow, let's look at Riley's statement. He says, \"Riley is not a knave.\" If Riley is a knight, then his statement is true, so Riley is a knave. If Riley is a knave, then his statement is false, so Riley is a knave.\n\nNow, let's consider possible scenarios.\n\nCase 1: Riley is a knight. Then his statement is true, so Riley is a knave. Then, Riley's statement is false, so Riley is a knight. Now, Riley is a knight, so his statement \"Liam is not a knave\" is false. Since Liam is a knight, his statement is true, so Liam is a knave. Now, Liam's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true, so Riley is a knight. Now, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the second part is true. So Riley is a knave. Now, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So Riley is a knave. Now, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the second part is true. So Riley is a knave. Now, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So the entire statement is true. So Riley is a knave.\n\nNow, Liam's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So the \"if and only if\" part is true. So Liam's statement is true. Therefore, Liam must be a knave. If Liam is a knave, then his statement is false, so Liam is a knight.\n\nSo putting it all together:\n\nRiley is a knight (because his statement was true)\nRiley is a knave (since his statement was false, so he's a knight)\nLiam is a knight (since his statement was false, he's a knave)\n\nWait, but let's check the others' statements again.\n\nRiley's statement: \"Liam is not a knave.\" Since Riley is a knight, the first part is true, so the OR is true. So Liam is a knight. Then, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So the OR is true. So Riley is a knight. Then, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So the OR is true. So all three are knights. But wait, that's a problem. Because the problem doesn't state that there's at least one knave. So the answer would be all three are knights. But let's check again.\n\nWait, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So the OR is true. So Riley is a knight. Then, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true. So",
+```
+
+可以发现第0步的rollout大部分都被1024的token输出长度截断，并且其中存在有明显的重复句段，比如`Then, Riley's statement: \"Samuel is a knight if and only if Riley is a knight.\" Since Riley is a knight, the first part is true...`被重复了3次，这也证明了经过SFT对齐的模型仅学会了DeepSeek-R1思维链中的固定格式以及"反思/检查"形式，但并没有真正利用思维链进行有效的推理。之后是第80步的rollout:
+```
+"<think>Okay, let's try to figure out who's the knight and who's the knave here. We have three people: Scarlett, Benjamin, and Daniel. Each made a statement. Let's break down their statements and see what their roles are.\n\nFirst, Scarlett says, \"Daniel is a knave and Scarlett is a knight.\" Wait, that's a contradiction. Because if Scarlett is a knight, then her statement must be true. But if Scarlett is a knave, then her statement is false, meaning both parts of the OR must be true. But the statement is a contradiction, so the negation of \"Daniel is a knave and Scarlett is a knight\" is always true. Therefore, Scarlett is a knave. Because if Scarlett is a knave, then her statement is false, meaning both parts are false. But if Scarlett is a knave, then the statement is false, so the negation of \"Daniel is a knave and Scarlett is a knight\" is true. But since Scarlett is a knave, the first part is false. So the entire statement is true, which aligns with Scarlett being a knave. Therefore, Scarlett is a knave.\n\nNow, Benjamin says, \"Daniel is a knave and Scarlett is a knight.\" Let's parse that. Let's assume Benjamin is a knight. Then his statement is true, so both parts are true. If Benjamin is a knight, then his statement is true, so both parts are true. But if Benjamin is a knight, then his statement is false, so the first part is true, but the second part is false, so the first part is false. Therefore, Benjamin must be a knight. Because if he's a knight, his statement is true, so he's a knave. So Benjamin is a knight.\n\nSo putting it all together: Scarlett is a knave, Benjamin is a knight, Daniel is a knave.\n</think>(1) Scarlett is a knave\n(2) Benjamin is a knight\n(3) Daniel is a knave</s>"
+```
+
+可以看出此时reasoning中的重复现象有了一定的缓解，且该rollout正确推理出了答案。但可以发现模型在首先推理`\"Daniel is a knave and Scarlett is a knight.\"`这句话时说`Because if Scarlett is a knight, then her statement must be true. But if Scarlett is a knave, then her statement is false, meaning both parts of the OR must be true. But the statement is a contradiction, so the negation of \"Daniel is a knave and Scarlett is a knight\" is always true. Therefore, Scarlett is a knave.`，其中出现了非常跳跃的结论推理，同时在针对Benjamin的推理中引用了错误的条件，这意味着模型最终的正确答案可能与reasoning关系不大。之后是第158步的rollout结果：
+```
+<think>Okay, let's try to figure out this knights and knaves problem. There are three people: Avery, Noah, and Harper. Each made a statement, and we need to determine who's a knight (truth-teller) and who's a knave (liar).\n\nFirst, let's break down each person's statement.\n\nAvery says, \"If Avery is a knight then Harper is a knave.\" That's a conditional statement. In logical terms, that's A \u2192 B. In logical terms, this is equivalent to A \u2228 B. So if Avery is a knight, then Harper must be a knave. If Avery is a knave, then Harper must be a knight.\n\nNoah says, \"Harper is a knave or Avery is a knight.\" That's a conditional statement. In logic, an implication \"If P then Q\" is only false if P is true and Q is false. So if Noah is a knight, then Harper is a knave. If Noah is a knave, then Harper is a knight.\n\nHarper says, \"Harper is a knave or Avery is a knight.\" That's a conditional statement. In logic, an implication \"If P then Q\" is only false if P is true and Q is false. So if Harper is a knight, then the statement must be true. If Harper is a knave, then the statement must be false. So the statement is false (Harper is a knave), which is a contradiction because Harper can't be a knight. Therefore, Harper must be a knave. Wait, but if Harper is a knave, then the statement is false. The statement is A \u2192 B. So if Harper is a knave, then A \u2192 B must be false. Since A is false (A is true), the statement is true regardless of B. So if Harper is a knave, then the statement is false, which would mean Harper is a knight. Therefore, Noah's statement is true, which aligns with Harper being a knave. So Noah is a knight.\n\nNow, if Noah is a knight, then Harper is a knave. Then Harper's statement is \"Harper is a knave or Avery is a knight.\" Since Harper is a knave, the second part is false. For the entire statement to be false, Harper must be a knight. So Harper is a knave (which we already know is true) and A is true (A is true). So if Noah is a knight, Harper is a knave.\n\nNow, Harper's statement: \"Harper is a knave or Avery is a knight.\" Since Harper is a knave, the second part is false. So the entire statement is false. Therefore, Harper is a knight.\n\nNow, let's consider possible scenarios. Let's assume Avery is a knight. Then his statement is true. So Harper is a knave (true) and Avery is a knight (false). If Avery is a knight, then Harper is a knave. But we assumed Harper is a knight. Then Harper's statement is \"Harper is a knave or Avery is a knight.\" Since Harper is a knave, the second part is true. So the entire statement is true regardless of A. So Noah's statement is true. Therefore, Noah is a knight.\n\nSo putting it all together: Avery is a knight, Noah is a knight, Harper is a knave.\n</think>(1) Avery is a knight\n(2) Noah is a knight\n(3) Harper is a knave</s>
+```
+
+可以发现此时整体的rollout条理性有了一定的提升，无意义的重复有一定减少，并且使用了形式化的推理进行表述，整体情况相比初始模型有了明显的改善。
+
+为了量化的探究GRPO对模型推理性能的提升，我继续使用3ppl的KK测试集进行验证，其中最大回复长度设置为2048，不同rollout次数下模型的pass rate如下：
+| Rollout | SFT Pass Rate | GRPO Pass Rate |
+| --- | --- | --- |
+| 1 | 7% | 20% |
+| 3 | 24% | 34% |
+| 16 | 68% | 56% |
+
+可以看出经过GRPO的模型在pass@1上提升了2倍，在pass@3上提升了约41%，但在pass@16上反而下降了约17%，这个结论与这篇论文中的观点[^yue2025RL]一致，即模型对复杂推理任务的解决能力上界在base model中已经定型，GRPO等现有RL算法主要让模型更倾向于优先输出"正确"答案，即提高pass@1通过率，但当答案采样变多时，RL对模型输出多样性和探索空间的限制反而让经过RL的模型在pass@k上低于base model
 
 ---
 
@@ -630,3 +693,5 @@ By using this code, you can easily sort any given array in ascending order.</s>
 [^sardana2024ChinchillaOptimal]: Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws. Sardana, Nikhil, et al. ICML'24.
 
 [^liu2024RPO]: Provably Mitigating Overoptimization in RLHF: Your SFT Loss is Implicitly an Adversarial Regularizer. Zhihan Liu, et al. NeurIPS'24.
+
+[^yue2025RL]: Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model? Yue Yang, et al. arXiv:2504.13837.

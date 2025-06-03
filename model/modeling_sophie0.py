@@ -566,7 +566,7 @@ class Sophie0Model(Sophie0PretraindModel):
         else:
             if use_cache and not isinstance(past_key_values, Cache): past_key_values = Cache.from_legacy_cache(past_key_values)
 
-        if kwargs.get("use_gradient_checkpoint", False) is True and self.supports_gradient_checkpointing and self.training: self.gradient_checkpointing_enable()
+        if kwargs.get("use_gradient_checkpoint", False) is True and self.supports_gradient_checkpointing and self.training: self.gradient_checkpointing = True
         else: self.gradient_checkpointing = False
 
         all_hidden_states = () if output_hidden_states else None
@@ -580,7 +580,8 @@ class Sophie0Model(Sophie0PretraindModel):
                     cu_seqlens,
                     max_seqlen,
                     True,
-                    past_key_values
+                    past_key_values,
+                    use_reentrant=False
                 )
             else:
                 hidden_states, _, past_key_values = layer(hidden_states, cu_seqlens, max_seqlen, True, past_key_values)
