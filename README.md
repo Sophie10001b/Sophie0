@@ -9,13 +9,13 @@
 <h3>简介</h3>
 </div>
 
-Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在于完整跑通**预训练(Pretrain)**、**监督微调(Supervised Fine-tune, SFT)**、**直接偏好优化(Direct Preference Optimization, DPO)**、以及基于**组内相对策略优化(Group Relative Policy Optimization)**的显示思维链推理等主要流程。其中预训练阶段使用BAAI开源的多领域数据集，总数据量约11B Tokens，消耗52x4 GPU hours；微调阶段使用BAAI以及数学CoT数据在内总计9.74M行对话数据，消耗24x8 GPU hours；DPO阶段使用BAAI的偏好数据以及从LLama 3提取的英语对话数据在内总计159.3k对数据，消耗1x4 GPU hours；GRPO阶段使用Knights & Knaves 3ppl数据集以及从DeepSeek-R1提取的思维链对模型进行SFT和GRPO，SFT阶段总计有1.5k条数据，GRPO阶段总计有500条prompt，前者消耗10min x 1 GPU Times，后者消耗51x2 GPU hours.
+Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在于完整跑通**预训练(Pretrain)**、**监督微调(Supervised Fine-tune, SFT)**、**直接偏好优化(Direct Preference Optimization, DPO)**、以及基于 **组内相对策略优化(Group Relative Policy Optimization, GRPO)** 的显示**思维链推理**等主要流程。其中预训练阶段使用BAAI开源的多领域数据集，总数据量约11B Tokens，消耗52x4 GPU hours；微调阶段使用BAAI以及数学CoT数据在内总计9.74M行对话数据，消耗24x8 GPU hours；DPO阶段使用BAAI的偏好数据以及从LLama 3提取的英语对话数据在内总计159.3k对数据，消耗1x4 GPU hours；GRPO阶段使用Knights & Knaves 3ppl数据集以及从DeepSeek-R1提取的思维链对模型进行SFT和GRPO，SFT阶段总计有1.5k条数据，GRPO阶段总计有500条prompt，前者消耗10min x 1 GPU Times，后者消耗51x2 GPU hours.
 
 此外，本项目进一步探讨了在下游SFT和DPO阶段完全使用变长(varlen)序列训练的可行性以及实现方式，充分利用了flash attention 2自带的`varlen attention` 和 `varlen RoPE`算子，同时也探讨了批量推理时引入的填充token对输出的影响，以及如何通过设计兼容varlen的KV Cache类直接基于Huggingface GenerationMixin接口无缝切块填充推理和无填充变长序列推理
 
 <div align="center">
 
-[![Model](https://img.shields.io/badge/Sophie0-0.5M-blue)]()
+[![Model](https://img.shields.io/badge/Sophie0-0.5B-blue)]()
 [![Format](https://img.shields.io/badge/Transformers-Format-yellow)]()
 [![Inference](https://img.shields.io/badge/Varlen-Inference-purple)]()
 
@@ -447,7 +447,7 @@ You can use this code by calling the `sortBy` function and passing the list of n
 
 比较遗憾的是，标准的reasoning模板并没有延续到通常的对话格式上，并且此时模型出现了明显的幻觉问题，可以看出单纯仅通过少样本的Knight & Knave数据集无法让模型学会通用的reasoning能力。
 
-**GRPO Alignment**&emsp; 在完成基础的SFT格式对齐后，便可以使用GRPO进一步提升模型的reasoning能力。具体来说，Sophie0的整体GRPO流程主要参考了Huggingface TRL框架里的实现方式，整体训练使用2张vGPU-32GB训练完成，总计51h，开销约171RMB。由于在基础实现下每张卡需要单独处理它负责batch的所有rollout结果，为了避免OOM，每张卡仅使用bathc size 1，rollout 16训练5 epochs，学习率上界设为5e-6，每epoch iteration与DeepSeek Math原文保持一致，也就是1，此时$\pi_{\theta} = \pi_{old}$，同时KL Loss的$\beta$使用TRL中默认的0.04。在bathch=1的情况下，Sophie0整体的GRPO流程如下：
+**GRPO Training**&emsp; 在完成基础的SFT格式对齐后，便可以使用GRPO进一步提升模型的reasoning能力。具体来说，Sophie0的整体GRPO流程主要参考了Huggingface TRL框架里的实现方式，整体训练使用2张vGPU-32GB训练完成，总计51h，开销约171RMB。由于在基础实现下每张卡需要单独处理它负责batch的所有rollout结果，为了避免OOM，每张卡仅使用bathc size 1，rollout 16训练5 epochs，学习率上界设为5e-6，每epoch iteration与DeepSeek Math原文保持一致，也就是1，此时$\pi_{\theta} = \pi_{old}$，同时KL Loss的$\beta$使用TRL中默认的0.04。在bathch=1的情况下，Sophie0整体的GRPO流程如下：
 1. 使用待训练模型$\pi_{\theta}$为prompt $p$采样生成16条rollout $o_i$
 2. 对每个batch的rollout计算格式得分：包含`<think>`, `</think>`, `</s>`各得(1/3 * 0.1)分；随后通过正则表达式计算答案得分，若3个角色的身份全对，则得1分，否则不得分。格式分数与答案分数相加得到该rollout总分 $r_i$
 3. 计算每个prompt的所有rollout的相对得分:
