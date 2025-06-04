@@ -607,7 +607,9 @@ You can use this code by calling the `sortBy` function and passing the list of n
 
 可以发现，模型虽然能够正确预测结束符，但是输出内容同样受到了影响。
 
-为了解决这个问题，Sophie0在Huggingface的GenerateMixin，Cache框架下额外实现了兼容varlen inference的流程。作为测试，我选择了相同的生成参数，仅将与varlen inference关联的`use_varlen_inference`打开，对应的生成结果如下：
+与此同时，现有框架方面，vLLM等框架通过paged-attention等核心算子对KV Cache进行分页管理，能够显著减少decoding阶段的内存碎片，从而提升相同机器支持的最大batch size，同时由于大部分情况下decoding阶段为memory bound，因此增大batch size时模型的单步推理耗时并不会随着batch size增大而线性上升，从而最终提高模型在batch decoding中的吞吐量。这在GRPO等需要rollout的RL训练中能够提升每一步支持的rollout数量，从而提高模型的样本利用效率。然而，目前vLLM等框架仅提供了对padding inference的集成教程，虽然理论上融入了Flash Attention2的API，但并没有提供有关varlen inference的接口。FlashInfer算子库虽然在更底层提供了专门的Ragged Layout处理paged varlen cache，但同样没有提供较为直观的集成示例。因此，为了解决这个问题，Sophie0在Huggingface的GenerateMixin，Cache框架下额外实现了兼容varlen inference的流程。
+
+作为测试，我选择了相同的生成参数，仅将与varlen inference关联的`use_varlen_inference`打开，对应的生成结果如下：
 ```
 0: <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><s><user>能否解释一下Transformer架构呢？</s>
 <s><bot>Transformer架构（Generative Adversarial Networks，GAN）是一种基于Transformer架构的神经网络架构，它通过一个卷积神经网络（GAN）来生成输出、预测和生成输出。GAN架构通过一个卷积层（Convolution）层，将输入的输入转换为输入输出，再通过一个卷积层来生成输出。GAN架构的核心是损失函数，它将输入的输出映射到输入层，然后通过损失函数将输出映射到输出层，最终输出输出。
