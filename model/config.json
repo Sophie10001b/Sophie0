@@ -1,0 +1,33 @@
+{
+  "_name_or_path": "Sophie0-SFT",
+  "architectures": [
+    "Sophie0ForCausalLM"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_sophie0.Sophie0Config",
+    "AutoModel": "modeling_sophie0.Sophie0Model",
+    "AutoModelForCausalLM": "modeling_sophie0.Sophie0ForCausalLM"
+  },
+  "bos_token_id": 0,
+  "bot_token_id": 10,
+  "dropout": 0.0,
+  "eos_token_id": 1,
+  "eps": 1e-05,
+  "hidden_act": "swish",
+  "hidden_size": 1024,
+  "intermediate_size": 4096,
+  "model_type": "transformer",
+  "num_heads": 16,
+  "num_hidden_layers": 28,
+  "num_kv_heads": 8,
+  "pad_token_id": 3,
+  "prompt_token_id": 8,
+  "right_shift": false,
+  "rope_base": 1000000,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.49.0",
+  "use_cache": true,
+  "user_token_id": 9,
+  "vocab_size": 65536,
+  "window_size": null
+}
