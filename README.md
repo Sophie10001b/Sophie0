@@ -702,7 +702,7 @@ By using this code, you can easily sort any given array in ascending order.</s>
 | Speed | 178.92s/it | 224.11s/it |
 | Max GPU Utilization | 55% | 46% |
 
-可以发现，Varlen形式的管理导致了大约25%左右的吞吐量下降，但相对的节省了27.5%的峰值显存占用，这个优势在多batch变长推理的情况下会进一步扩大。同时，由于Sophie0在除去pretrain以外的阶段均使用了varlen形式完成训练，因此padding-free形式的推理策略对于Sophie0来说也是十分必要的
+可以发现，Varlen形式的管理导致了大约25%左右的推理速度下降，但相对的节省了27.5%的峰值显存占用，这个优势在多batch变长推理的情况下会进一步扩大。同时，由于Sophie0在除去pretrain以外的阶段均使用了varlen形式完成训练，因此padding-free形式的推理策略对于Sophie0来说也是十分必要的
 
 ---
 
