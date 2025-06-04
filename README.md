@@ -13,6 +13,14 @@ Sophie0是一个从头实现的单人0.5B大语言模型项目，主要核心在
 
 此外，本项目进一步探讨了在下游SFT和DPO阶段完全使用变长(varlen)序列训练的可行性以及实现方式，充分利用了flash attention 2自带的`varlen attention` 和 `varlen RoPE`算子，同时也探讨了批量推理时引入的填充token对输出的影响，以及如何通过设计兼容varlen的KV Cache类直接基于Huggingface GenerationMixin接口无缝切块填充推理和无填充变长序列推理
 
+以下为模型checkpoint的对应页面：
+| Model | Checkpoint |
+| --- | --- |
+| SFT | [Sophie0-SFT](https://huggingface.co/SophieA17/Sophie0-SFT) |
+| DPO | [Sophie0-DPO](https://huggingface.co/SophieA17/Sophie0-DPO) |
+| Reasoning-SFT | [Sophie0-Reasoning-SFT](https://huggingface.co/SophieA17/Sophie0-Reasoning-SFT) |
+| Reasoning-GRPO | [Sophie0-Reasoning-GRPO](https://huggingface.co/SophieA17/Sophie0-Reasoning-GRPO) |
+
 <div align="center">
 
 [![Model](https://img.shields.io/badge/Sophie0-0.5B-blue)]()

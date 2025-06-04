@@ -1,7 +1,7 @@
 /data/pretrain/*
 /data/sft/**/*
 /data/dpo/**/*
-/data/reasoning/*
+/data/reasoning/cache
 /data/benchmark/**/*
 /result
 /cache

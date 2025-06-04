@@ -40,7 +40,6 @@ torch.set_float32_matmul_precision("medium")
 # HF_CACHE = os.environ["HF_HOME"]
 HF_CACHE = "/root/autodl-tmp/hf_cache"
 os.environ["HF_HOME"] = HF_CACHE
-# api = d9f9f42bdc91cdc59144b5ed1dce53b098f17fd6
 
 class GRPODataset(torch.utils.data.Dataset):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
