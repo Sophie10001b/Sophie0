@@ -455,7 +455,9 @@ You can use this code by calling the `sortBy` function and passing the list of n
 
 比较遗憾的是，标准的reasoning模板并没有延续到通常的对话格式上，并且此时模型出现了明显的幻觉问题，可以看出单纯仅通过少样本的Knight & Knave数据集无法让模型学会通用的reasoning能力。
 
-**GRPO Training**&emsp; 在完成基础的SFT格式对齐后，便可以使用GRPO进一步提升模型的reasoning能力。具体来说，Sophie0的整体GRPO流程主要参考了Huggingface TRL框架里的实现方式，整体训练使用2张vGPU-32GB训练完成，总计51h，开销约171RMB。由于在基础实现下每张卡需要单独处理它负责batch的所有rollout结果，为了避免OOM，每张卡仅使用bathc size 1，rollout 16训练5 epochs，学习率上界设为5e-6，每epoch iteration与DeepSeek Math原文保持一致，也就是1，此时$\pi_{\theta} = \pi_{old}$，同时KL Loss的$\beta$使用TRL中默认的0.04。在bathch=1的情况下，Sophie0整体的GRPO流程如下：
+**GRPO Training**&emsp; 在完成基础的SFT格式对齐后，便可以使用GRPO进一步提升模型的reasoning能力。具体来说，Sophie0的整体GRPO流程主要参考了Huggingface TRL框架里的实现方式，整体训练使用2张vGPU-32GB训练完成，总计51h，开销约171RMB。由于在基础实现下每张卡需要单独处理它负责batch的所有rollout结果，为了避免OOM，每张卡仅使用bathc size 1，rollout 16训练5 epochs，学习率上界设为5e-6，每epoch iteration与DeepSeek Math原文保持一致，也就是1，此时$\pi_{\theta} = \pi_{old}$，同时KL Loss的$\beta$使用TRL中默认的0.04。**值得注意的是，由于FSDP1会对所有参数进行flatten，这导致generate过程无法正确完成计算，因此在GRPO训练时全程采用FSDP2并行**
+
+在bathch=1的情况下，Sophie0整体的GRPO流程如下：
 1. 使用待训练模型$\pi_{\theta}$为prompt $p$采样生成16条rollout $o_i$
 2. 对每个batch的rollout计算格式得分：包含`<think>`, `</think>`, `</s>`各得(1/3 * 0.1)分；随后通过正则表达式计算答案得分，若3个角色的身份全对，则得1分，否则不得分。格式分数与答案分数相加得到该rollout总分 $r_i$
 3. 计算每个prompt的所有rollout的相对得分:
