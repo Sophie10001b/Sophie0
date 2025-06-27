@@ -27,7 +27,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from flash_attn.bert_padding import unpad_input
 from copy import deepcopy
 from torch_scatter import scatter
-from torchmetrics import MeanMetric, SumMetric, Metric
+from torchmetrics import MeanMetric, SumMetric, Metric, Accuracy
 from swanlab.integration.pytorch_lightning import SwanLabLogger
 
 from model.modeling_sophie0 import Sophie0ForCausalLM
@@ -103,28 +103,58 @@ class GRPODataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.datas)
 
-class GRPODataModule(LightningDataModule):
+class KKDataset(torch.utils.data.Dataset):
     def __init__(self, tokenizer: AutoTokenizer, model_config: PretrainedConfig, train_config: argparse.Namespace, **kwargs):
         super().__init__(**kwargs)
 
+        self.tokenizer = tokenizer
         self.model_config = model_config
         self.train_config = train_config
 
-        self.data = GRPODataset(tokenizer, model_config, train_config, **kwargs)
-    
-    def setup(self, stage):
-        pass
-
-    def train_dataloader(self):
-        return torch.utils.data.DataLoader(
-            self.data,
-            batch_size=self.train_config.batch_size,
-            shuffle=True,
-            num_workers=self.train_config.num_workers,
-            collate_fn=self.data.process,
-            persistent_workers=True,
-            pin_memory=True
+        datas: Dataset = load_dataset("json", data_files=[os.path.join(train_config.data_path, "people3_num100.jsonl")], split="train", streaming=False, trust_remote_code=True, cache_dir=HF_CACHE, num_proc=4)
+        self.datas = datas.map(
+            self.convert_kk_dataset,
+            batched=True,
+            batch_size=1000,
+            num_proc=4,
+            remove_columns=datas.column_names,
+            load_from_cache_file=False
         )
+
+    def convert_kk_dataset(self, raw):
+        prompts = []
+        target = []
+        for i, (quiz, names, solution) in enumerate(zip(raw["quiz"], raw["names"], raw["solution"])):
+            user_input = f"<s><user>{quiz}</s>\n<s><bot>"
+            patterns = []
+            for _name, _solution in zip(names, solution):
+                character = "knight" if _solution else "knave"
+                patterns.append(rf"[\s]*\([\d]\)[\s]?{_name} is a [kK]{character[1:]}")
+            
+            prompts.append(user_input)
+            target.append(patterns)
+        
+        return {
+            "input_ids": prompts,
+            "labels": target
+        }
+    
+    def process(self, indices: list[int]):
+        input_ids = self.datas.select(indices)["input_ids"]
+        labels = self.datas.select(indices)["labels"]
+        
+        inputs = self.tokenizer(input_ids, return_tensors="pt", padding="longest", padding_side="left")
+        return dict(
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            labels=labels
+        )
+    
+    def __getitem__(self, idx: int):
+        return idx
+    
+    def __len__(self):
+        return len(self.datas)
 
 #########################################################
 #                  --- model ---
@@ -145,6 +175,10 @@ class GRPOModule(LightningModule):
         if self.ref_model is not None:
             self.ref_model.eval()
             self.ref_model.requires_grad_(False)
+        
+        self.infer_model = deepcopy(self.model)
+        self.infer_model.eval()
+        self.infer_model.requires_grad_(False)
 
         self.save_hyperparameters(train_config)
 
@@ -185,6 +219,10 @@ class GRPOModule(LightningModule):
         }
         if self.ref_model is not None:
             self.train_metrics["kl_loss"] = MeanMetric().to(self.trainer.strategy.root_device)
+
+        self.eval_metrics = {
+            "pass@1": Accuracy(task="multiclass", num_classes=2).to(self.trainer.strategy.root_device)
+        }
 
         self.last_output_steps = -1
     
@@ -235,6 +273,7 @@ class GRPOModule(LightningModule):
     def configure_model(self):
         if isinstance(self.trainer.strategy, ModelParallelStrategy):
             self.model = parallelize_setting(self.model, self.device_mesh)
+            self.infer_model = parallelize_setting(self.infer_model, self.device_mesh)
             if self.ref_model is not None:
                 self.ref_model = parallelize_setting(self.ref_model, self.device_mesh)
     
@@ -257,7 +296,7 @@ class GRPOModule(LightningModule):
         format_reward = 0.
         if rollout.count("<think>") == 1: format_reward += 1/3
         if rollout.count("</think>") == 1: format_reward += 1/3
-        if rollout.count("</s>") == 1: format_reward += 1/3
+        if rollout.split("<bot>")[-1].count("</s>") == 1: format_reward += 1/3
 
         bot_ids = self.tokenizer.vocab["<bot>"]
         eos_ids = self.tokenizer.vocab["</s>"]
@@ -392,9 +431,9 @@ class GRPOModule(LightningModule):
 
     def forward(self, data: Dict):
         # Step 1: generate response for each request
-        self.model.train(False)
         with torch.no_grad():
-            rollout = self.model.generate(
+            self.infer_model.load_state_dict(deepcopy(self.model.state_dict()))
+            rollout = self.infer_model.generate(
                 input_ids=data["input_ids"].repeat_interleave(self.train_config.rollout, dim=0),
                 attention_mask=data["attention_mask"].repeat_interleave(self.train_config.rollout, dim=0),
                 use_cache=True,
@@ -406,8 +445,6 @@ class GRPOModule(LightningModule):
             rollout_reward = self._compute_reward(rollout_seq, rollout.sequences.cpu().tolist(), data["labels"])
             del rollout
             torch.cuda.empty_cache()
-
-        self.model.train(True)
         
         # Step 2: forward pass to get the prob of rollout
         rollout_seq = list(map(lambda x: re.sub(self.tokenizer.pad_token, "", x), rollout_seq))
@@ -511,6 +548,44 @@ class GRPOModule(LightningModule):
                 if isinstance(v, Metric): v.reset()
 
         return outputs["loss"]
+    
+    def on_validation_epoch_start(self):
+        self.response_cache = []
+        for k, v in self.eval_metrics.items():
+            if isinstance(v, Metric): v.reset()
+
+    def validation_step(self, batch: Dict, batch_idx):
+        with torch.no_grad():
+            rollout = self.model.generate(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                use_cache=True,
+                use_varlen_inference=True,
+                generation_config=self.generation_config
+            )
+            outputs = self.tokenizer.batch_decode(rollout.sequences, skip_special_tokens=False)
+        
+        correct_cache = [0 for _ in range(len(outputs))]
+        for i, output in enumerate(outputs):
+            response = output.split("<bot>")[-1]
+            if (response.count("<think>") != 1 or response.count("</think>") != 1 or response.count("</s>") != 1): continue
+            answer = response.split("</think>")[-1]
+            is_correct = True
+            answer_patterns = batch["labels"][i]
+            for answer_pattern in answer_patterns:
+                if re.search(answer_pattern, answer) is None: is_correct = False
+            
+            if is_correct:
+                correct_cache[i] = 1
+        
+        correct_cache = torch.tensor(correct_cache, device=self.trainer.strategy.root_device)
+        label_cache = torch.ones_like(correct_cache)
+        self.eval_metrics["pass@1"].update(correct_cache, label_cache)
+    
+    def on_validation_epoch_end(self):
+        for k, v in self.eval_metrics.items():
+            if isinstance(v, Metric):
+                self.log(f"eval/{k}", v.compute(), sync_dist=True)
 
 def main(train_config: argparse.Namespace):
     pl.seed_everything(train_config.seed)
@@ -532,7 +607,6 @@ def main(train_config: argparse.Namespace):
         data_parallel_size=torch.cuda.device_count(),
         save_distributed_checkpoint=False
     )
-    # strategy = DDPStrategy()
     trainer = Trainer(
         precision=train_config.precision,
         strategy=strategy if torch.cuda.device_count() > 1 else "auto",
@@ -542,27 +616,26 @@ def main(train_config: argparse.Namespace):
         accumulate_grad_batches=train_config.accumulate_grad_batches,
         gradient_clip_val=1.0,
         logger=logger,
-        log_every_n_steps=train_config.log_every_n_steps
+        log_every_n_steps=train_config.log_every_n_steps,
+        enable_checkpointing=False,
+        val_check_interval=0.5
     )
-    # callbacks=ModelCheckpoint(
-    #         every_n_epochs=1 if train_config.save_steps == -1 else None,
-    #         every_n_train_steps=train_config.save_steps if train_config.save_steps != -1 else None,
-    #         save_weights_only=True,
-    #         save_on_train_epoch_end=True
-    #     ),
 
     raw_batch_size = train_config.batch_size
     if trainer.num_devices > 1:
         train_config.batch_size = train_config.batch_size // trainer.num_devices
+        train_config.eval_batch_size = train_config.eval_batch_size // trainer.num_devices
     if trainer.accumulate_grad_batches > 1: 
         train_config.batch_size = train_config.batch_size // trainer.accumulate_grad_batches
 
     model = Sophie0ForCausalLM(model_config)
     ref_model = Sophie0ForCausalLM(model_config) if train_config.kl_beta > 0. else None
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(os.path.join(_dir, "model", "tokenizer"), use_fast=True, trust_remote_code=True, local_files_only=True)
-    datamodule = GRPODataModule(tokenizer, model_config, train_config)
 
-    if train_config.max_steps == -1: train_config.max_steps = ((len(datamodule.data) + raw_batch_size - 1) // raw_batch_size) * train_config.max_epochs
+    train_dataset = GRPODataset(tokenizer, model_config, train_config)
+    eval_dataset = KKDataset(tokenizer, model_config, train_config)
+
+    if train_config.max_steps == -1: train_config.max_steps = ((len(train_dataset) + raw_batch_size - 1) // raw_batch_size) * train_config.max_epochs
 
     if train_config.pretrained_ckpt_path != "": 
         _state_dict = torch.load(train_config.pretrained_ckpt_path, map_location='cpu', weights_only=True)
@@ -570,7 +643,26 @@ def main(train_config: argparse.Namespace):
         if ref_model is not None: ref_model.load_state_dict(_state_dict)
 
     plmodel = GRPOModule(tokenizer, model, ref_model, model_config, train_config)
-    trainer.fit(plmodel, datamodule=datamodule)
+    trainer.fit(
+        plmodel,
+        train_dataloaders=torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=True,
+            num_workers=train_config.num_workers,
+            collate_fn=train_dataset.process,
+            persistent_workers=True,
+            pin_memory=True
+        ),
+        val_dataloaders=torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=train_config.eval_batch_size,
+            shuffle=False,
+            num_workers=train_config.num_workers,
+            collate_fn=eval_dataset.process,
+            pin_memory=True
+        )
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -583,6 +675,7 @@ if __name__ == "__main__":
     grpo_parser.add_argument("--pretrained_ckpt_path", type=str, default="", help="Path to the pretrained checkpoint")
 
     grpo_parser.add_argument("--batch_size", type=int, default=1)
+    grpo_parser.add_argument("--eval_batch_size", type=int, default=16)
     grpo_parser.add_argument("--accumulate_grad_batches", type=int, default=1, help="Accumulate gradients for every n batches")
     grpo_parser.add_argument("--num_workers", type=int, default=4)
     grpo_parser.add_argument("--log_every_n_steps", type=int, default=20)

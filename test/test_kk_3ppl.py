@@ -73,7 +73,7 @@ class KKDataset(torch.utils.data.Dataset):
         input_ids = self.datas.select(indices)["input_ids"]
         labels = self.datas.select(indices)["labels"]
         
-        inputs = tokenizer(input_ids, return_tensors="pt", padding="longest", padding_side="left")
+        inputs = self.tokenizer(input_ids, return_tensors="pt", padding="longest", padding_side="left")
         return dict(
             input_ids=inputs.input_ids,
             attention_mask=inputs.attention_mask,
@@ -107,7 +107,7 @@ if __name__ == "__main__":
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
-        max_new_tokens=4096,
+        max_new_tokens=2048,
         do_sample=True,
         top_k=20,
         top_p=0.7,
@@ -117,7 +117,7 @@ if __name__ == "__main__":
         use_cache=True
     )
 
-    batch_size = 1
+    batch_size = 25
     dataset = KKDataset(tokenizer, data_path)
     dataloader = torch.utils.data.DataLoader(
         dataset=dataset,
@@ -126,7 +126,7 @@ if __name__ == "__main__":
         collate_fn=dataset.process
     )
 
-    shot_num = 10
+    shot_num = 1
     result_cache = {
         "format_correct": 0,
         "reasoning_complete": 0,
@@ -143,13 +143,13 @@ if __name__ == "__main__":
                 input_ids=input_ids.to(device),
                 attention_mask=attention_mask.to(device),
                 use_cache=True,
-                use_varlen_inference=False,
+                use_varlen_inference=True,
                 generation_config=generate_config
             )
         
         outputs = tokenizer.batch_decode(outputs, skip_special_tokens=False)
-        for i in range(0, len(outputs), batch_size):
-            batch_outputs = outputs[i:i+batch_size]
+        for i in range(0, len(outputs), shot_num):
+            batch_outputs = outputs[i:i+shot_num]
             batch_ids = i // shot_num
             
             answer_correct = False
