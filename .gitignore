@@ -8,6 +8,7 @@
 /dpo_hf*
 /dpo_padding*
 /accelerate_config.yaml
+/model/fa_test.py
 __pycache__
 .vscode
 .DS_Store

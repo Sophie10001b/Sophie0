@@ -1,3 +1,4 @@
+import time
 import math
 import torch
 import numpy as np
@@ -20,6 +21,7 @@ from itertools import chain
 from flash_attn.bert_padding import unpad_input
 
 from .configuration_sophie0 import Sophie0Config
+from .flash_decoding_triton import flash_decoding_varlen
 from transformers.modeling_utils import PreTrainedModel
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
@@ -309,6 +311,135 @@ class VarlenCache(transformers.cache_utils.Cache):
                 cache.states.append(past_key_values[layer_idx])
         return cache
 
+class DecodingVarlenCache(transformers.cache_utils.Cache):
+    """
+    A varlen cache used for storing hidden states produced by varlen batch inference. Managed by:
+    PrefillCache [2, total_nnz, dmodel]
+    DecodeCache [2, total_seqs, max_len, dmodel]
+
+    **Input:**
+        - attn_state: Cache for standard attention, tuple(size(total_nnz, dmodel) * 2)
+    """
+
+    is_compileable = True
+
+    def __init__(self, cache_position: int = 0, batch_size: int = 1, device: str | torch.device = None):
+        super().__init__()
+
+        self.states: List[Dict[str, Any]] = []
+        self._cache_position = []
+        self._current_step = []
+        self._prefill_cu_seqlens = None
+        self.batch_size =  batch_size
+        self.chunk_size = 128
+        self.device = device
+    
+    def __getitem__(self, layer_idx: int) -> Dict[str, Any]:
+        if layer_idx < len(self):
+            return self.states[layer_idx]
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+
+    def __iter__(self):
+        for state in self.states: yield state
+
+    def __len__(self):
+        return len(self.states)
+    
+    def update(
+        self,
+        attn_state: Tuple[torch.Tensor, torch.Tensor] = None,
+        cu_seqlens: torch.LongTensor = None,
+        layer_idx: int = 0,
+        cache_kwargs: Optional[Dict[str, Any]] = {},
+    ) -> Dict[str, Any]:
+        """
+        Updates the cache with the new `attn_state` for the layer `layer_idx`.
+
+        Args:
+            attn_state (`Tuple[torch.Tensor, torch.Tensor]`, `optional`):
+                The new attention key/value states to cache, sizes (total_nnz, num_heads, head_size)
+            cu_seqlens (`torch.LongTensor`):
+                the accumulated sequence length for current states, sizes (bsz + 1,)
+            layer_idx (`int`, defaults to 0):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass.
+
+        Return:
+            Dictionary of the updated state.
+        """
+
+        if attn_state is not None:
+            if not isinstance(attn_state, Tuple) or len(attn_state) != 2:
+                raise ValueError("`attn_state` must be a tuple of two tensors for key/value states")
+
+        # Case 1: prefill at the 1st step
+        if len(self._cache_position) <= layer_idx:
+            self._cache_position.append(
+                torch.zeros((cu_seqlens.size(0) - 1,), dtype=torch.int64, device=cu_seqlens.device)
+            )
+            self._current_step.append(0)
+            self._prefill_cu_seqlens = cu_seqlens.clone().detach()
+
+        kv_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        self._cache_position[layer_idx] += kv_seqlens
+
+        if len(self.states) <= layer_idx:
+            state = dict(
+                prefill_state=torch.stack(attn_state, dim=0),
+                decode_state=torch.empty((2, cu_seqlens.size(0)-1, self.chunk_size, attn_state[0].size(-2), attn_state[0].size(-1)), dtype=attn_state[0].dtype, device=attn_state[0].device)
+            )
+            self.states.append(state)
+
+        # Case 2: append current step's kv cache
+        else:
+            state = self.states[layer_idx]
+            step = self._current_step[layer_idx]
+
+            if step >= state["decode_state"].size(2):
+                state["decode_state"] = torch.cat([state["decode_state"], torch.empty_like(state["decode_state"])], dim=2)
+
+            state["decode_state"][:, :, step] = torch.stack(attn_state, dim=0)
+            self._current_step[layer_idx] += 1
+        
+        return state
+    
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> torch.Tensor:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        if len(self.states) <= layer_idx:
+            return torch.zeros(self.batch_size, dtype=torch.int64, device=self.device)
+        return self._cache_position[layer_idx]
+    
+    def get_step(self, layer_idx: Optional[int] = 0) -> int:
+        if len(self.states) <= layer_idx: return 0
+        else: return self._current_step[layer_idx]
+
+    def get_max_length(self) -> Optional[int]:
+        """Returns the maximum sequence length of the cached states. Cache does not have a maximum length."""
+        return None
+
+    def to_legacy_cache(self) -> Tuple:
+        return tuple(self.states)
+    
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorders the cache for beam search, given the selected beam indices."""
+        raise NotImplementedError("Varlen Batch Inference does not support beam search at now.")
+    
+    @classmethod
+    @torch.compiler.disable
+    def from_legacy_cache(
+        cls,
+        past_key_values: Optional[Tuple] = None,
+        cache_position: int = 0,
+        batch_size: int = 1,
+        device: str | torch.device = None
+    ):
+        """Converts a cache in the legacy cache format into an equivalent `Cache`."""
+
+        cache = cls(cache_position, batch_size=batch_size, device=device)
+        return cache
+
 @torch.no_grad()
 def linear_init(
     linear: nn.Linear,
@@ -377,6 +508,7 @@ class FullAttention(nn.Module):
         self.out = nn.Linear(hidden_size, hidden_size, bias=False)
         self.rotary = RotaryEmbedding(dim=self.head_size, base=rotary_base)
 
+        self.current_step = 0
         self._init_weights()
     
     def _init_weights(self):
@@ -396,6 +528,8 @@ class FullAttention(nn.Module):
         cu_seqlens -> None
         """
 
+        self.current_step += 1
+        start_time = time.perf_counter()
         if cu_seqlens is None:
             qkv: torch.Tensor = self.qkv(x)
             qkv = rearrange(qkv, "B L (H D) -> B L H D", H=(self.num_q_heads + 2 * self.num_kv_heads), D=self.head_size)
@@ -458,6 +592,7 @@ class FullAttention(nn.Module):
                 out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=self.dropout if self.training else 0, causal=causal)
             out = self.out(rearrange(out, "L H D -> L (H D)"))
 
+        if self.layer_idx == 0: print(f"step {self.current_step}: {time.perf_counter() - start_time:.4f}")
         return out, None, past_key_values
 
 class TransformerBlock(nn.Module):
