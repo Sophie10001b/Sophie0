@@ -750,6 +750,12 @@ By using this code, you can easily sort any given array in ascending order.</s>
 
 可以发现，Varlen形式的管理导致了大约25%左右的推理速度下降，但相对的节省了27.5%的峰值显存占用，这个优势在多batch变长推理的情况下会进一步扩大。同时，由于Sophie0在除去pretrain以外的阶段均使用了varlen形式完成训练，因此padding-free形式的推理策略对于Sophie0来说也是十分必要的
 
+**Optimization**&emsp; 针对varlen推理时kv cache管理繁琐，以及目前vllm，sglang等框架暂未提供完整的varlen推理教程的问题，目前共尝试了两类自定义方案：
+1. 自定义decoding阶段flash attention算子 (`model/flash_decoding_triton.py`)。在prefill阶段使用原始的`flash_attention_varlen`系列算子，并将prefill cache (sparse)与decode cache (dense)分开管理，使用统一的decoding算子直接完成计算。
+2. 自定义varlen形式kv cache的更新算子 (`model/kv_manage_triton.py`)。保持varlen形式的kv cache，并直接使用独立的算子将当前步的kv cache并入原始cache内，从而在减少kv cache拼接相关算子开销的同时简化kv cache管理。
+
+不过，虽然目前的两种方法在独立的benchmark环境中均显示出了明显的speedup，但在kk数据集inference场景下，发现两类triton算子均在不定推理步数后出现明显的性能下降，且具体触发步数受到autotune设置以及输入的影响，目前暂时无法确定是由triton编译本身导致的问题，还是transformers框架导致的问题，因此暂时保持使用原版的varlen推理策略
+
 ---
 
 ### References

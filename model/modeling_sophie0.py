@@ -508,7 +508,7 @@ class FullAttention(nn.Module):
         self.out = nn.Linear(hidden_size, hidden_size, bias=False)
         self.rotary = RotaryEmbedding(dim=self.head_size, base=rotary_base)
 
-        self.current_step = 0
+        # self.current_step = 0
         self._init_weights()
     
     def _init_weights(self):
@@ -528,8 +528,8 @@ class FullAttention(nn.Module):
         cu_seqlens -> None
         """
 
-        self.current_step += 1
-        start_time = time.perf_counter()
+        # self.current_step += 1
+        # start_time = time.perf_counter()
         if cu_seqlens is None:
             qkv: torch.Tensor = self.qkv(x)
             qkv = rearrange(qkv, "B L (H D) -> B L H D", H=(self.num_q_heads + 2 * self.num_kv_heads), D=self.head_size)
@@ -592,7 +592,7 @@ class FullAttention(nn.Module):
                 out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=self.dropout if self.training else 0, causal=causal)
             out = self.out(rearrange(out, "L H D -> L (H D)"))
 
-        if self.layer_idx == 0: print(f"step {self.current_step}: {time.perf_counter() - start_time:.4f}")
+        # if self.layer_idx == 0: print(f"step {self.current_step}: {time.perf_counter() - start_time:.4f}")
         return out, None, past_key_values
 
 class TransformerBlock(nn.Module):
